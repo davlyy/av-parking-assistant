@@ -5,3 +5,4 @@ __pycache__/
 *.onnx
 data/raw/
 .env
+.idea
