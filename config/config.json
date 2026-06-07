@@ -1,0 +1,46 @@
+{
+  "source_type": "carla",
+  "Camera": {
+    "device_id": 0,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "calibration": {
+      "fx": 600.0,
+      "fy": 600.0,
+      "cx": 640.0,
+      "cy": 360.0
+    }
+  },
+  "Carla": {
+    "host": "localhost",
+    "port": 2000,
+    "timeout": 10.0,
+    "manual": true,
+    "synchronous": true,
+    "autopilot": false,
+    "scenario": {
+      "map": "Town01",
+      "weather": "ClearNoon",
+      "ego_vehicle": {
+        "model": "vehicle.lincoln.mkz_2017",
+        "spawn_point_index": 0
+      }
+    },
+    "camera": {
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 20
+      },
+      "rotation": {
+        "pitch": -90.0,
+        "yaw": 90.0,
+        "roll": 0.0
+      },
+      "width": 1280,
+      "height": 720,
+      "fov": 90
+    }
+  }
+}
