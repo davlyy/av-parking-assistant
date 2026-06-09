@@ -1,5 +1,5 @@
 from __future__ import annotations
-from input.config import CarlaConfig, CarlaCameraConfig, Vector3D, Rotation3D
+from input.config import CarlaConfig, CarlaCameraConfig, Vector3D, Rotation3D, SpawnPoint
 from input.source_iface import Frame
 import numpy as np
 import time
@@ -45,22 +45,67 @@ class CarlaSource:
 
         self._world = world
         blueprint_library = world.get_blueprint_library()
-        vehicle_bp = blueprint_library.filter(self._config.scenario.ego_vehicle.model)[0]
 
-        spawn_points = world.get_map().get_spawn_points()
-        spawn_idx = self._config.scenario.ego_vehicle.spawn_point_index
-        if spawn_idx >= len(spawn_points):
-            raise RuntimeError(f"Spawn point index {spawn_idx} out of range (max {len(spawn_points) - 1})")
+        vehicle_bps = blueprint_library.filter(self._config.scenario.ego_vehicle.model)
+        if not vehicle_bps:
+            raise RuntimeError(
+                f"Blueprint '{self._config.scenario.ego_vehicle.model}' not found. "
+                f"Available vehicle models: {[bp.id for bp in blueprint_library.filter('vehicle.*')[:10]]}"
+            )
+        vehicle_bp = vehicle_bps[0]
 
-        self._vehicle = world.try_spawn_actor(vehicle_bp, spawn_points[spawn_idx])
+        # Tick once so the world is ready for spawning
+        if self._config.synchronous:
+            self._world.tick()
+        else:
+            self._world.wait_for_tick()
+
+        sp = self._config.scenario.ego_vehicle.spawn_point
+        if sp is not None:
+            preferred_transform = carla.Transform(
+                carla.Location(sp.x, sp.y, sp.z),
+                carla.Rotation(yaw=sp.yaw),
+            )
+        else:
+            spawn_points = world.get_map().get_spawn_points()
+            spawn_idx = self._config.scenario.ego_vehicle.spawn_point_index
+            if spawn_idx >= len(spawn_points):
+                raise RuntimeError(f"Spawn point index {spawn_idx} out of range (max {len(spawn_points) - 1})")
+            preferred_transform = spawn_points[spawn_idx]
+
+        self._vehicle = world.try_spawn_actor(vehicle_bp, preferred_transform)
+        if self._vehicle is None and sp is not None:
+            offsets = [(x, y) for x in range(-3, 4) for y in range(-3, 4) if x != 0 or y != 0]
+            for dx, dy in offsets:
+                t = carla.Transform(
+                    carla.Location(sp.x + dx, sp.y + dy, sp.z),
+                    carla.Rotation(yaw=sp.yaw),
+                )
+                self._vehicle = world.try_spawn_actor(vehicle_bp, t)
+                if self._vehicle is not None:
+                    break
+
         if self._vehicle is None:
-            raise RuntimeError("Failed to spawn ego vehicle")
+            fallback_points = world.get_map().get_spawn_points()
+            import random
+            random.shuffle(fallback_points)
+            for pt in fallback_points[:20]:
+                self._vehicle = world.try_spawn_actor(vehicle_bp, pt)
+                if self._vehicle is not None:
+                    break
+
+        if self._vehicle is None:
+            raise RuntimeError(
+                "Failed to spawn ego vehicle. Make sure the CARLA server is running "
+                "and the map is loaded."
+            )
 
         if self._config.autopilot:
             self._vehicle.set_autopilot(True)
             self._autopilot_enabled = True
 
         self._setup_camera()
+        # self._draw_boundaries()
 
         if self._config.synchronous:
             self._world.tick()
@@ -114,6 +159,21 @@ class CarlaSource:
         )
         self._camera.listen(lambda image: self._on_image(image))
 
+    def _draw_boundaries(self) -> None:
+        bd = self._config.scenario.boundaries
+        if bd is None:
+            return
+        import carla
+        self._world.debug.draw_box(
+            carla.BoundingBox(
+                carla.Location(x=bd.center.x, y=bd.center.y, z=bd.center.z),
+                carla.Vector3D(x=bd.extent.x, y=bd.extent.y, z=bd.extent.z),
+            ),
+            carla.Rotation(),
+            thickness=0.15,
+            life_time=0,
+        )
+
     def _on_image(self, image) -> None:
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = array.reshape((image.height, image.width, 4))
@@ -150,11 +210,28 @@ class CarlaSource:
 
         return True
 
+    def vehicle_pose(self) -> tuple[float, float, float, float]:
+        t = self._vehicle.get_transform()
+        return (t.location.x, t.location.y, t.location.z, t.rotation.yaw)
+
     def _render_pygame(self, frame: Frame) -> None:
         import pygame
 
         surface = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
         self._pygame_display.blit(surface, (0, 0))
+
+        x, y, z, yaw = self.vehicle_pose()
+        font = pygame.font.Font(None, 28)
+        lines = [
+            f"X: {x:.1f}",
+            f"Y: {y:.1f}",
+            f"Z: {z:.1f}",
+            f"Yaw: {yaw:.1f}",
+        ]
+        for i, line in enumerate(lines):
+            text = font.render(line, True, (0, 255, 0), (0, 0, 0))
+            self._pygame_display.blit(text, (10, 10 + i * 24))
+
         pygame.display.flip()
         self._pygame_clock.tick(60)
 

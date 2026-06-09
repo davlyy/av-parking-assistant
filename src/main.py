@@ -16,6 +16,20 @@ def create_source(config: SourceConfig):
     return source
 
 
+def _draw_coords(frame, source) -> None:
+    if isinstance(source, CarlaSource):
+        x, y, z, yaw = source.vehicle_pose()
+        lines = [
+            f"X: {x:.1f}",
+            f"Y: {y:.1f}",
+            f"Z: {z:.1f}",
+            f"Yaw: {yaw:.1f}",
+        ]
+        for i, line in enumerate(lines):
+            cv2.putText(frame, line, (10, 30 + i * 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+
 def run(source, config: SourceConfig) -> None:
     source.open()
     try:
@@ -27,6 +41,7 @@ def run(source, config: SourceConfig) -> None:
             for frame in source:
                 if frame is None:
                     break
+                _draw_coords(frame, source)
                 cv2.imshow(f"Input - {config.source_type}", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -49,9 +64,24 @@ def main() -> None:
         default="./config/config.json",
         help="Path to JSON config file",
     )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default="scenario_1",
+        help="Named scenario preset from config",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    if args.scenario and config.carla and args.scenario in config.carla.scenarios:
+        import dataclasses
+        preset = config.carla.scenarios[args.scenario]
+        config = dataclasses.replace(
+            config,
+            carla=dataclasses.replace(config.carla, scenario=preset, scenario_name=args.scenario),
+        )
+
     source = create_source(config)
     run(source, config)
 

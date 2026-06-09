@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
-from typing import Literal, get_type_hints
+from typing import Literal, get_type_hints, Any
 
 
 @dataclass(frozen=True)
@@ -36,9 +36,24 @@ class Rotation3D:
 
 
 @dataclass(frozen=True)
+class SpawnPoint:
+    x: float
+    y: float
+    z: float
+    yaw: float
+
+
+@dataclass(frozen=True)
+class BoundariesConfig:
+    center: Vector3D
+    extent: Vector3D
+
+
+@dataclass(frozen=True)
 class EgoVehicleConfig:
     model: str = "vehicle.lincoln.mkz_2017"
     spawn_point_index: int = 0
+    spawn_point: SpawnPoint | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +61,7 @@ class CarlaScenarioConfig:
     map: str = "Town01"
     weather: str = "ClearNoon"
     ego_vehicle: EgoVehicleConfig = field(default_factory=EgoVehicleConfig)
+    boundaries: BoundariesConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,8 @@ class CarlaConfig:
     synchronous: bool = True
     autopilot: bool = False
     scenario: CarlaScenarioConfig = field(default_factory=CarlaScenarioConfig)
+    scenarios: dict[str, CarlaScenarioConfig] = field(default_factory=dict)
+    scenario_name: str | None = None
     camera: CarlaCameraConfig | None = None
 
 
@@ -91,12 +109,31 @@ def _dict_to_dataclass(d: dict, cls):
             ft = hints[k]
             origin = getattr(ft, "__origin__", None)
             if origin is not None:
-                kwargs[k] = v
+                if origin is dict:
+                    kwargs[k] = v
+                else:
+                    kwargs[k] = v
             elif hasattr(ft, "__dataclass_fields__"):
                 kwargs[k] = _dict_to_dataclass(v, ft) if isinstance(v, dict) else v
             else:
                 kwargs[k] = v
     return cls(**kwargs)
+
+
+def _parse_scenario(raw: dict) -> CarlaScenarioConfig:
+    ego = raw.get("ego_vehicle", {})
+    sp = ego.get("spawn_point")
+    bd = raw.get("boundaries")
+    return CarlaScenarioConfig(
+        map=raw.get("map", "Town01"),
+        weather=raw.get("weather", "ClearNoon"),
+        ego_vehicle=EgoVehicleConfig(
+            model=ego.get("model", "vehicle.lincoln.mkz_2017"),
+            spawn_point_index=ego.get("spawn_point_index", 0),
+            spawn_point=_dict_to_dataclass(sp, SpawnPoint) if sp else None,
+        ),
+        boundaries=_dict_to_dataclass(bd, BoundariesConfig) if bd else None,
+    )
 
 
 def _pick(raw: dict, *keys: str) -> dict | None:
@@ -129,9 +166,13 @@ def load_config(path: str | Path) -> SourceConfig:
     elif source_type == "carla":
         crl = _pick(raw, "Carla", "carla")
         if crl:
-            scenario = crl.get("scenario", {})
-            ego_vehicle = scenario.get("ego_vehicle", {})
             cam_cfg = crl.get("camera")
+            raw_scenarios = crl.get("scenarios", {})
+            scenarios: dict[str, CarlaScenarioConfig] = {}
+            for name, s in raw_scenarios.items():
+                if isinstance(s, dict):
+                    scenarios[name] = _parse_scenario(s)
+
             carla = CarlaConfig(
                 host=crl.get("host", "localhost"),
                 port=crl.get("port", 2000),
@@ -139,14 +180,8 @@ def load_config(path: str | Path) -> SourceConfig:
                 manual=crl.get("manual", False),
                 synchronous=crl.get("synchronous", True),
                 autopilot=crl.get("autopilot", False),
-                scenario=CarlaScenarioConfig(
-                    map=scenario.get("map", "Town01"),
-                    weather=scenario.get("weather", "ClearNoon"),
-                    ego_vehicle=EgoVehicleConfig(
-                        model=ego_vehicle.get("model", "vehicle.lincoln.mkz_2017"),
-                        spawn_point_index=ego_vehicle.get("spawn_point_index", 0),
-                    ),
-                ),
+                scenario=_parse_scenario(crl.get("scenario", {})),
+                scenarios=scenarios,
                 camera=_dict_to_dataclass(cam_cfg, CarlaCameraConfig) if cam_cfg else None,
             )
 
