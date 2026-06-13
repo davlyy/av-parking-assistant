@@ -2,6 +2,17 @@ from dataclasses import dataclass
 
 Box = tuple[int, int, int, int]
 Coordinate2D = tuple[int, int]
+WHEELBASE = 3.309 #TODO: replace with real value
+MAX_STEERING_ANGLE = 0.44157 #TODO: replace with real value
+STEERING_ANGLES = [-MAX_STEERING_ANGLE, #- left, + right
+                   -2/3* MAX_STEERING_ANGLE,
+                   -1/3* MAX_STEERING_ANGLE,
+                   0.0,
+                   1/3* MAX_STEERING_ANGLE,
+                   2/3* MAX_STEERING_ANGLE,
+                   MAX_STEERING_ANGLE]
+DIRECTIONS = [-1, #reverse
+              1] #forward
 
 @dataclass(frozen=True)
 class YawAngle:
@@ -22,3 +33,17 @@ class Pose:
     """
     coordinates: Coordinate2D
     orientation: YawAngle
+
+@dataclass
+class Node:
+    x: float
+    y: float
+    theta: float
+    idx: tuple[int, int, int]
+    parent: object = None
+    g_cost: float = 0.0
+    h_cost: float = 0.0
+
+    @property
+    def f_cost(self):
+        return self.g_cost + self.h_cost

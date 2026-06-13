@@ -4,5 +4,6 @@ pygame
 networkx
 # carla — install from CARLA simulator package (not on PyPI): pip install <carla_path>/PythonAPI/carla/dist/carla-<version>.tar.gz
 
+rsplan
 numpy
 ultralytics
