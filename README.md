@@ -264,3 +264,31 @@ The system interface contracts are defined in `src/ifaces/` for perception, path
 | `PathToRoute`         | `algorithms_iface.py`   | Smooth path into drivable route        |
 | `Preprocessing`       | `util_iface.py`         | Prepare image for model inference      |
 | `Display`             | `util_iface.py`         | Render guidance overlay                |
+
+## Frame Processing Pipeline
+
+```mermaid
+flowchart TD
+    A[RAW FRAME] --> B[Stage 0: Camera Calibration / IPM]
+    B -->|pixel → metric BEV| C[Stage 1: Preprocessing]
+    C -->|denoise, normalize| D[Stage 2: Lane Marking Detection]
+    D -->|slot grid geometry| E[Stage 3: Object Detection]
+    E -->|YOLO / classical blob| F[Stage 4: Slot Occupancy]
+    F -->|car-slot overlap check| G[Stage 5: Ego-Vehicle ID]
+    G -->|identify 'us'| H[Stage 6: Coordinate Mapping]
+    H -->|pixel → x,y,yaw,L,W| I[Stage 7: JSON Payload]
+    I -->|A* planner input| J((Path Planner))
+```
+
+### Pipeline Stages
+
+| Stage | Name | Description |
+|-------|------|-------------|
+| **0** | Camera Calibration / IPM | Convert pixel coordinates → bird's-eye metric coordinates |
+| **1** | Preprocessing | Denoise, normalize illumination (CLAHE, bilateral filter) |
+| **2** | Lane Marking Detection | Detect white slot lines → reconstruct slot grid geometry |
+| **3** | Object Detection | Detect all vehicles (YOLOv8 or classical blob detection) |
+| **4** | Slot Occupancy | For each slot: check if a detected vehicle overlaps it |
+| **5** | Ego-Vehicle Identification | Determine which detected vehicle is "us" |
+| **6** | Coordinate Mapping | Convert pixel bboxes → metric poses `(x, y, yaw, length, width)` |
+| **7** | JSON Payload Assembly | Assemble structured data for the A* path planner |
