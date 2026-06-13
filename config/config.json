@@ -42,7 +42,7 @@
       }
     },
     "camera": {
-      "position": { "x": 0, "y": 0, "z": 30 },
+      "position": { "x": 0, "y": 0, "z": 55 },
       "rotation": { "pitch": -90, "yaw": 0, "roll": 0 },
       "width": 1280,
       "height": 720,
