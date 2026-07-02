@@ -1,33 +1,47 @@
 from ifaces.data_iface import *
 from ifaces.algorithms_iface import PathPlanning
 import numpy as np
-import rsplan as rp
+import heapq
+import itertools
 
-def plan_path(payload: dict, ego_world_pose: dict | None = None) -> list[Node]:
-    if ego_world_pose is not None:
-        payload = convert_payload_to_carla_world(payload, ego_world_pose)
+vehicle: Vehicle = Vehicle()
+gridmap: GridMap3D = GridMap3D()
+config: Config = Config()
+carla_config: CarlaConfig = CarlaConfig()
 
-        print("After conversion:")
-        print("start:", payload["start_pose"])
-        print("goal:", payload["goal_pose"])
-        for i, obs in enumerate(payload.get("obstacles", [])):
-            print(f"obs {i}:", obs)
+def plan_path(
+    payload: dict,
+    ego_world_pose: dict | None = None,
+    already_world: bool = False,
+) -> list[Node]:
+    if not already_world:
+        transform_cfg = get_coordinate_transform(payload)
+        transform_type = transform_cfg["type"]
 
-    gridmap = build_gridMap(payload)
+        if transform_type == "carla_ego":
+            if ego_world_pose is None:
+                raise ValueError(
+                    "ego_world_pose is required for coordinate_transform type='carla_ego'"
+                )
+
+            payload = convert_payload_to_carla_world(
+                payload,
+                ego_world_pose,
+            )
+
+        elif transform_type == "world":
+            payload = payload.copy()
+
+        else:
+            raise ValueError(
+                f"Unsupported coordinate_transform type: {transform_type}"
+            )
+
+    vehicle_init(payload)
+    gridmap_init(payload)
 
     start = payload_pose_to_node(payload["start_pose"], gridmap)
     end = payload_pose_to_node(payload["goal_pose"], gridmap)
-
-    print("Start inside:", is_inside_grid(gridmap, start))
-    print("End inside:", is_inside_grid(gridmap, end))
-    print("Start collision free:", is_collision_free(gridmap, start))
-    print("End collision free:", is_collision_free(gridmap, end))
-
-    sx, sy = world_to_grid(start.x, start.y, gridmap)
-    gx, gy = world_to_grid(end.x, end.y, gridmap)
-
-    print("Start grid:", sx, sy, "occ:", gridmap.occupancy[sy, sx], "dist:", gridmap.distance[sy, sx])
-    print("Goal grid:", gx, gy, "occ:", gridmap.occupancy[gy, gx], "dist:", gridmap.distance[gy, gx])
 
     path = hybrid_A_star(gridmap, start, end)
 
@@ -39,12 +53,7 @@ def plan_path(payload: dict, ego_world_pose: dict | None = None) -> list[Node]:
 
 type_checking_variable: PathPlanning = plan_path
 
-import heapq
-import itertools
-
-def hybrid_A_star(gridmap: GridMap, start: Node, end: Node) -> list | None:
-    GOAL_TOLERANCE = 3.0
-    MAX_ITERATIONS = 200000
+def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
 
     closed = set()
     open_nodes = {}
@@ -56,7 +65,7 @@ def hybrid_A_star(gridmap: GridMap, start: Node, end: Node) -> list | None:
     start.h_cost = heuristic_cost(start, end)
 
     open_nodes[start.idx] = start
-    heapq.heappush(heap, (start.f_cost, next(counter), start.idx))
+    heapq.heappush(heap, (priority(start), next(counter), start.idx))
 
     iterations = 0
     best_dist_seen = float("inf")
@@ -64,7 +73,7 @@ def hybrid_A_star(gridmap: GridMap, start: Node, end: Node) -> list | None:
     while heap:
         iterations += 1
 
-        if iterations > MAX_ITERATIONS:
+        if iterations > config.max_iterations:
             print("Stopped after iteration limit")
             print("iterations:", iterations)
             print("closed:", len(closed))
@@ -97,7 +106,7 @@ def hybrid_A_star(gridmap: GridMap, start: Node, end: Node) -> list | None:
                 "current_dist:", round(dist_to_goal, 2),
             )
 
-        if dist_to_goal < GOAL_TOLERANCE:
+        if dist_to_goal < config.goal_tolerance:
             print("iterations:", iterations)
             print("closed:", len(closed))
             print("best_dist_seen:", best_dist_seen)
@@ -110,14 +119,16 @@ def hybrid_A_star(gridmap: GridMap, start: Node, end: Node) -> list | None:
             if not is_collision_free(gridmap, node):
                 continue
 
-            if not is_inside_search_corridor(node, start, end, margin=20.0):
+            if not is_inside_search_corridor(node, start, end, margin=config.search_margin):
                 continue
+            node.g_cost = current.g_cost + transition_cost(current, node, gridmap)
+            node.h_cost = heuristic_cost(node, end)
 
             old = open_nodes.get(node.idx)
 
             if old is None or node.g_cost < old.g_cost:
                 open_nodes[node.idx] = node
-                heapq.heappush(heap, (node.f_cost, next(counter), node.idx))
+                heapq.heappush(heap, (priority(node), next(counter), node.idx))
 
     print("iterations:", iterations)
     print("closed:", len(closed))
@@ -125,6 +136,164 @@ def hybrid_A_star(gridmap: GridMap, start: Node, end: Node) -> list | None:
     print("best_dist_seen:", best_dist_seen)
 
     return None
+
+def distance_to_goal(pose: dict, goal_pose: dict) -> float:
+    dx = float(pose["x"]) - float(goal_pose["x"])
+    dy = float(pose["y"]) - float(goal_pose["y"])
+
+    return (dx ** 2 + dy ** 2) ** 0.5
+
+
+def is_within_goal_tolerance(
+    pose: dict | None,
+    goal_pose: dict | None,
+    goal_tolerance: float,
+) -> bool:
+    if pose is None or goal_pose is None:
+        return False
+
+    return distance_to_goal(pose, goal_pose) <= goal_tolerance
+
+def carla_transform_from_config() -> dict:
+    cfg = carla_config.__dict__.copy()
+
+    transform_cfg = {
+        key.removeprefix("transform_"): value
+        for key, value in cfg.items()
+        if key.startswith("transform_")
+    }
+
+    transform_cfg["type"] = cfg["coordinate_transform_type"]
+
+    return transform_cfg
+
+
+def get_coordinate_transform(payload: dict) -> dict:
+    payload_cfg = payload.get("coordinate_transform")
+
+    # Kein Eintrag im Payload -> CARLA-Fallback
+    if payload_cfg is None:
+        return carla_transform_from_config()
+
+    if not isinstance(payload_cfg, dict):
+        raise TypeError(
+            f"'coordinate_transform' must be a dict, got {type(payload_cfg)}"
+        )
+
+    if "type" not in payload_cfg:
+        raise ValueError(
+            "'coordinate_transform' in payload must contain a 'type' field"
+        )
+
+    # Wichtig: nicht mit carla_config mergen.
+    # Payload ist entweder vollständig world oder vollständig carla_ego.
+    return payload_cfg
+
+
+def normalize_parking_slots(payload: dict) -> list[dict]:
+    raw_slots = payload.get("parking_slots", None)
+
+    if raw_slots is None:
+        raw_slots = payload.get("parking_slot", None)
+
+    if raw_slots is None:
+        return []
+
+    if isinstance(raw_slots, dict):
+        raw_slots = [raw_slots]
+
+    if not isinstance(raw_slots, list):
+        raise TypeError(
+            "'parking_slot' or 'parking_slots' must be either a dict or a list of dicts"
+        )
+
+    slots = []
+
+    for i, slot in enumerate(raw_slots):
+        if not isinstance(slot, dict):
+            raise TypeError(
+                f"Parking slot at index {i} must be a dict, got {type(slot)}"
+            )
+
+        if not slot.get("free", True):
+            continue
+
+        slots.append({
+            **slot,
+            "id": slot.get("id", i),
+            "free": slot.get("free", True),
+        })
+
+    return slots
+
+
+def local_to_carla_relative(
+    local_dx: float,
+    local_dy: float,
+    transform_cfg: dict,
+) -> tuple[float, float]:
+    transform_type = transform_cfg.get("type")
+
+    if transform_type != "carla_ego":
+        raise ValueError(
+            f"local_to_carla_relative requires type='carla_ego', got {transform_type}"
+        )
+
+    required_keys = [
+        "scale_x",
+        "scale_y",
+        "offset_x",
+        "offset_y",
+        "swap_xy",
+        "invert_x",
+        "invert_y",
+    ]
+
+    missing = [key for key in required_keys if key not in transform_cfg]
+
+    if missing:
+        raise ValueError(
+            f"Missing keys for carla_ego transform: {missing}"
+        )
+
+    scale_x = float(transform_cfg["scale_x"])
+    scale_y = float(transform_cfg["scale_y"])
+
+    offset_x = float(transform_cfg["offset_x"])
+    offset_y = float(transform_cfg["offset_y"])
+
+    swap_xy = bool(transform_cfg["swap_xy"])
+    invert_x = bool(transform_cfg["invert_x"])
+    invert_y = bool(transform_cfg["invert_y"])
+
+    if swap_xy:
+        dx = local_dy
+        dy = local_dx
+    else:
+        dx = local_dx
+        dy = local_dy
+
+    if invert_x:
+        dx = -dx
+
+    if invert_y:
+        dy = -dy
+
+    dx = scale_x * dx + offset_x
+    dy = scale_y * dy + offset_y
+
+    return dx, dy
+
+def vehicle_init(payload: dict):
+    global vehicle
+    vehicle_data = payload.get("vehicle", {})
+    vehicle.wheelbase = vehicle_data["wheelbase"]
+    vehicle.max_steering = vehicle_data["max_steer"]
+    vehicle.width = vehicle_data["width"]
+    vehicle.length = vehicle_data["length"]
+
+def priority(node: Node) -> float:
+    return node.g_cost + config.heuristic_weight * node.h_cost
 
 def reconstruct_path(node):
     path = []
@@ -147,12 +316,12 @@ def is_inside_search_corridor(node: Node, start: Node, end: Node, margin: float 
 def heuristic_cost(node: Node, end: Node) -> float:
     return np.hypot(end.x - node.x, end.y - node.y)
 
-def world_to_grid(x: float, y: float, gridmap: GridMap) -> tuple[int, int]:
+def world_to_grid(x: float, y: float, gridmap: GridMap3D) -> tuple[int, int]:
     x_idx = int(round((x - gridmap.origin_x) / gridmap.resolution))
     y_idx = int(round((y - gridmap.origin_y) / gridmap.resolution))
     return x_idx, y_idx
 
-def payload_pose_to_node(pose: dict, gridmap: GridMap) -> Node:
+def payload_pose_to_node(pose: dict, gridmap: GridMap3D) -> Node:
     x = float(pose["x"])
     y = float(pose["y"])
     theta = float(pose["yaw"])
@@ -163,25 +332,20 @@ def payload_pose_to_node(pose: dict, gridmap: GridMap) -> Node:
         theta=theta,
         idx=make_idx(x, y, theta, gridmap),
     )
-"""
-def node_to_pose(node: Node) -> Pose:
-    return Pose(
-        coordinates=(node.x, node.y),
-        orientation=YawAngle(float(np.rad2deg(node.theta) % 360.0))
-    )
-"""
-def make_idx(x: float, y: float, theta: float, gridmap: GridMap) -> tuple[int, int, int]:
+
+def make_idx(x: float, y: float, theta: float, gridmap: GridMap3D) -> tuple[int, int, int]:
     x_idx, y_idx = world_to_grid(x, y, gridmap)
 
     theta_norm = normalize_angle(theta)
-    theta_idx = int(np.floor((theta_norm + np.pi) / THETA_RESOLUTION))
+    theta_idx = int(np.floor((theta_norm + np.pi) / gridmap.theta_resolution))
 
     return x_idx, y_idx, theta_idx
 
 def normalize_angle(angle: float) -> float:
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
-def build_gridMap(payload: dict) -> GridMap:
+def gridmap_init(payload: dict):
+    global gridmap
     margin = 5.0
     obstacle_inflation = 0.3  # extra safety margin around obstacles in meters
 
@@ -199,30 +363,29 @@ def build_gridMap(payload: dict) -> GridMap:
         xs.extend([float(obs["x"]) - r, float(obs["x"]) + r])
         ys.extend([float(obs["y"]) - r, float(obs["y"]) + r])
 
-    if "parking_slot" in payload:
-        slot = payload["parking_slot"]
+    for slot in normalize_parking_slots(payload):
         r = 0.5 * np.hypot(float(slot["length"]), float(slot["width"]))
         xs.extend([float(slot["x"]) - r, float(slot["x"]) + r])
         ys.extend([float(slot["y"]) - r, float(slot["y"]) + r])
 
-    origin_x = min(xs) - margin
-    origin_y = min(ys) - margin
+    gridmap.origin_x = min(xs) - margin
+    gridmap.origin_y = min(ys) - margin
 
     max_x = max(xs) + margin
     max_y = max(ys) + margin
 
-    width_m = max_x - origin_x
-    height_m = max_y - origin_y
+    width_m = max_x - gridmap.origin_x
+    height_m = max_y - gridmap.origin_y
 
-    width_cells = int(np.ceil(width_m / GRID_RESOLUTION)) + 1
-    height_cells = int(np.ceil(height_m / GRID_RESOLUTION)) + 1
+    width_cells = int(np.ceil(width_m / gridmap.resolution)) + 1
+    height_cells = int(np.ceil(height_m / gridmap.resolution)) + 1
 
-    occupancy = np.zeros((height_cells, width_cells), dtype=np.uint8)
+    gridmap.occupancy = np.zeros((height_cells, width_cells), dtype=np.uint8)
 
     # Helper: world coordinates -> grid indices
     def _world_to_grid_local(x: float, y: float) -> tuple[int, int]:
-        x_idx = int(round((x - origin_x) / GRID_RESOLUTION))
-        y_idx = int(round((y - origin_y) / GRID_RESOLUTION))
+        x_idx = int(round((x - gridmap.origin_x) / gridmap.resolution))
+        y_idx = int(round((y - gridmap.origin_y) / gridmap.resolution))
         return x_idx, y_idx
 
     # Rasterize every obstacle rectangle into occupancy
@@ -249,8 +412,8 @@ def build_gridMap(payload: dict) -> GridMap:
 
         for y_idx in range(y_min, y_max + 1):
             for x_idx in range(x_min, x_max + 1):
-                wx = origin_x + x_idx * GRID_RESOLUTION
-                wy = origin_y + y_idx * GRID_RESOLUTION
+                wx = gridmap.origin_x + x_idx * gridmap.resolution
+                wy = gridmap.origin_y + y_idx * gridmap.resolution
 
                 dx = wx - cx
                 dy = wy - cy
@@ -260,33 +423,26 @@ def build_gridMap(payload: dict) -> GridMap:
                 local_y = -sin_yaw * dx + cos_yaw * dy
 
                 if abs(local_x) <= half_l and abs(local_y) <= half_w:
-                    occupancy[y_idx, x_idx] = 1
+                    gridmap.occupancy[y_idx, x_idx] = 1
 
     # Distance map: distance to nearest occupied cell in meters
     try:
         from scipy.ndimage import distance_transform_edt
 
-        distance = distance_transform_edt(1 - occupancy) * GRID_RESOLUTION
+        gridmap.distance = distance_transform_edt(1 - gridmap.occupancy) * gridmap.resolution
     except ImportError:
         # Fallback: no distance penalty, only hard occupancy collision
-        distance = np.full_like(occupancy, fill_value=999.0, dtype=float)
+        gridmap.distance = np.full_like(gridmap.occupancy, fill_value=999.0, dtype=float)
 
-    return GridMap(
-        occupancy=occupancy,
-        distance=distance,
-        resolution=GRID_RESOLUTION,
-        origin_x=origin_x,
-        origin_y=origin_y,
-    )
 
-def is_collision_free(gridmap: GridMap, node) -> bool:
+def is_collision_free(gridmap: GridMap3D, node) -> bool:
     if not is_inside_grid(gridmap, node):
         return False
 
     x_idx, y_idx = world_to_grid(node.x, node.y, gridmap)
     return gridmap.occupancy[y_idx, x_idx] == 0
 
-def is_collision_free_rs_curve(gridmap: GridMap, rs_curve) -> bool:
+def is_collision_free_rs_curve(gridmap: GridMap3D, rs_curve) -> bool:
     height, width = gridmap.occupancy.shape
 
     for wp in rs_curve.waypoints():
@@ -300,22 +456,23 @@ def is_collision_free_rs_curve(gridmap: GridMap, rs_curve) -> bool:
 
     return True
 
-def is_inside_grid(gridmap: GridMap, node) -> bool:
+def is_inside_grid(gridmap: GridMap3D, node) -> bool:
     height, width = gridmap.occupancy.shape
     x_idx, y_idx = world_to_grid(node.x, node.y, gridmap)
 
     return 0 <= x_idx < width and 0 <= y_idx < height
 
-def node_expansion(current: Node, gridmap: GridMap, end:Node) -> list[Node]:
+def node_expansion(current: Node, gridmap: GridMap3D, end:Node) -> list[Node]:
+    global vehicle
     children = []
 
-    for direction in DIRECTIONS:
-        for steer in STEERING_ANGLES:
-            x_new = current.x + direction * D_SIZE * np.cos(current.theta)
-            y_new = current.y + direction * D_SIZE * np.sin(current.theta)
+    for direction in vehicle.directions:
+        for steer in vehicle.steering_angles:
+            x_new = current.x + direction * config.dsize * np.cos(current.theta)
+            y_new = current.y + direction * config.dsize * np.sin(current.theta)
 
             theta_new = current.theta + (
-                direction * D_SIZE / WHEELBASE * np.tan(steer)
+                direction * config.dsize / vehicle.wheelbase * np.tan(steer)
             )
             theta_new = normalize_angle(theta_new)
 
@@ -331,35 +488,41 @@ def node_expansion(current: Node, gridmap: GridMap, end:Node) -> list[Node]:
                 direction=direction
             )
 
-            child.g_cost = current.g_cost + transition_cost(current, child, gridmap)
-            child.h_cost = heuristic_cost(child, end)
-
             children.append(child)
 
     return children
 
-def transition_cost(current: Node, node: Node, gridmap: GridMap) -> float:
-    cost1 = OMEGA_1 * D_SIZE
+def transition_cost(current: Node, node: Node, gridmap: GridMap3D) -> float:
+    current_steer = float(getattr(current, "steer", 0.0))
+    node_steer = float(getattr(node, "steer", 0.0))
 
-    current_steer = getattr(current, "steer", 0.0)
-    node_steer = getattr(node, "steer", 0.0)
-    cost2 = OMEGA_2 * abs(node_steer - current_steer)
+    cost_length = config.omega_1 * config.dsize
+    cost_steer_change = config.omega_2 * abs(node_steer - current_steer)
+    cost_obstacle = config.omega_3 * obstacle_distance_cost(gridmap, node)
 
-    cost3 = OMEGA_3 * obstacle_distance_cost(gridmap, node)
+    max_steer = max(float(vehicle.max_steering), 1e-6)
+    normalized_steer = abs(node_steer) / max_steer
 
-    return cost1 + cost2 + cost3
+    cost_steer_angle = 0.15 * normalized_steer * config.dsize
 
-def obstacle_distance_cost(gridmap: GridMap, node: Node) -> float:
+    return (
+        cost_length
+        + cost_steer_change
+        + cost_steer_angle
+        + cost_obstacle
+    )
+
+def obstacle_distance_cost(gridmap: GridMap3D, node: Node) -> float:
     if not is_inside_grid(gridmap, node):
         return float("inf")
 
     x_idx, y_idx = world_to_grid(node.x, node.y, gridmap)
     d = gridmap.distance[y_idx, x_idx]
 
-    if d >= D0:
+    if d >= config.d0:
         return 0.0
 
-    return EPSILON / (EPSILON + d)
+    return config.epsilon / (config.epsilon + d)
 
 def flatten_path(path) -> list[Node]:
     nodes = []
@@ -390,6 +553,19 @@ def flatten_path(path) -> list[Node]:
 def convert_payload_to_carla_world(payload: dict, ego_world_pose: dict) -> dict:
     payload = payload.copy()
 
+    transform_cfg = get_coordinate_transform(payload)
+    transform_type = transform_cfg["type"]
+
+    if transform_type != "carla_ego":
+        raise ValueError(
+            f"convert_payload_to_carla_world requires type='carla_ego', got {transform_type}"
+        )
+
+    if ego_world_pose is None:
+        raise ValueError(
+            "ego_world_pose is required for convert_payload_to_carla_world"
+        )
+
     local_start = payload["start_pose"]
 
     local_start_x = float(local_start["x"])
@@ -404,14 +580,11 @@ def convert_payload_to_carla_world(payload: dict, ego_world_pose: dict) -> dict:
         local_dx = local_x - local_start_x
         local_dy = local_y - local_start_y
 
-        SCALE_X = 1.0
-        SCALE_Y = 1.0
-
-        OFFSET_X = 9.8
-        OFFSET_Y = 0.0
-
-        dx = -SCALE_X * local_dy + OFFSET_X
-        dy = SCALE_Y * local_dx + OFFSET_Y
+        dx, dy = local_to_carla_relative(
+            local_dx,
+            local_dy,
+            transform_cfg,
+        )
 
         c = np.cos(world_start_yaw)
         s = np.sin(world_start_yaw)
@@ -432,20 +605,27 @@ def convert_payload_to_carla_world(payload: dict, ego_world_pose: dict) -> dict:
     }
 
     # goal
-    gx, gy = transform_point(
-        float(payload["goal_pose"]["x"]),
-        float(payload["goal_pose"]["y"]),
-    )
-    payload["goal_pose"] = {
-        "x": gx,
-        "y": gy,
-        "yaw": transform_yaw(float(payload["goal_pose"].get("yaw", 0.0))),
-    }
+    if "goal_pose" in payload:
+        gx, gy = transform_point(
+            float(payload["goal_pose"]["x"]),
+            float(payload["goal_pose"]["y"]),
+        )
+
+        payload["goal_pose"] = {
+            "x": gx,
+            "y": gy,
+            "yaw": transform_yaw(float(payload["goal_pose"].get("yaw", 0.0))),
+        }
 
     # obstacles
     new_obstacles = []
+
     for obs in payload.get("obstacles", []):
-        ox, oy = transform_point(float(obs["x"]), float(obs["y"]))
+        ox, oy = transform_point(
+            float(obs["x"]),
+            float(obs["y"]),
+        )
+
         new_obstacles.append({
             **obs,
             "x": ox,
@@ -455,70 +635,29 @@ def convert_payload_to_carla_world(payload: dict, ego_world_pose: dict) -> dict:
 
     payload["obstacles"] = new_obstacles
 
-    # parking slot
-    if "parking_slot" in payload:
-        slot = payload["parking_slot"]
-        sx, sy = transform_point(float(slot["x"]), float(slot["y"]))
-        payload["parking_slot"] = {
+    # parking slot(s)
+    new_slots = []
+
+    for slot in normalize_parking_slots(payload):
+        sx, sy = transform_point(
+            float(slot["x"]),
+            float(slot["y"]),
+        )
+
+        new_slots.append({
             **slot,
             "x": sx,
             "y": sy,
             "yaw": transform_yaw(float(slot.get("yaw", 0.0))),
-        }
+        })
+
+    payload["parking_slots"] = new_slots
+    payload.pop("parking_slot", None)
+
+    # Wichtig: Ab jetzt ist das Payload bereits in Welt-/CARLA-Koordinaten.
+    # Dadurch vermeidest du versehentliche Doppeltransformationen.
+    payload["coordinate_transform"] = {
+        "type": "world"
+    }
 
     return payload
-
-def draw_obstacles_in_carla(source, payload: dict, z: float = 1.2, life_time: float = 0.1) -> None:
-    import carla
-    import math
-
-    world = source._client.get_world()
-    debug = world.debug
-
-    for i, obs in enumerate(payload.get("obstacles", [])):
-        cx = float(obs["x"])
-        cy = float(obs["y"])
-        yaw = float(obs.get("yaw", 0.0))
-
-        half_l = float(obs["length"]) / 2.0
-        half_w = float(obs["width"]) / 2.0
-
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-
-        corners = []
-        for lx, ly in [
-            (+half_l, +half_w),
-            (+half_l, -half_w),
-            (-half_l, -half_w),
-            (-half_l, +half_w),
-        ]:
-            x = cx + c * lx - s * ly
-            y = cy + s * lx + c * ly
-            corners.append(carla.Location(x=x, y=y, z=z))
-
-        for a, b in zip(corners, corners[1:] + corners[:1]):
-            debug.draw_line(
-                a,
-                b,
-                thickness=0.08,
-                color=carla.Color(255, 255, 0),
-                life_time=life_time,
-            )
-
-        center = carla.Location(x=cx, y=cy, z=z)
-
-        debug.draw_point(
-            center,
-            size=0.2,
-            color=carla.Color(255, 255, 0),
-            life_time=life_time,
-        )
-
-        debug.draw_string(
-            center,
-            f"obs {i}",
-            draw_shadow=False,
-            color=carla.Color(255, 255, 0),
-            life_time=life_time,
-        )

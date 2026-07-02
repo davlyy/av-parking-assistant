@@ -1,52 +1,60 @@
 from dataclasses import dataclass
-
+import math
 import numpy as np
 
-fac = 10
 Box = tuple[int, int, int, int]
 Coordinate2D = tuple[int, int]
-WHEELBASE = 3.309 #TODO: replace with real value
-MAX_STEERING_ANGLE = 0.44157 #TODO: replace with real value
-GRID_RESOLUTION = 0.25
-THETA_RESOLUTION = 0.05
-D_SIZE = 0.6
 
-OMEGA_1 = 10.0/fac  # distance cost
-OMEGA_2 = 5.0/fac  # steer change cost
-OMEGA_3 = 15.0/fac  # obstacle distance cost
+@dataclass()
+class Config:
+    dsize: float = 1.0
+    omega_1 = 0.5  # distance cost
+    omega_2 = 0.5  # steer change cost
+    omega_3 = 5.0  # obstacle distance cost
+    d0 = 1.5
+    epsilon = 0.1
+    heuristic_weight = 1.5
+    search_margin: float = 20.0
+    goal_tolerance: float = 1.2
+    max_iterations: int = 200000
+    omega_steer_angle: float = 2.0
+    omega_reverse: float = 0.2
+    omega_direction_change: float = 2.0
 
-D0 = 1.5
-EPSILON = 0.1
-STEERING_ANGLES = [-MAX_STEERING_ANGLE, #- left, + right
-                   -2/3* MAX_STEERING_ANGLE,
-                   -1/3* MAX_STEERING_ANGLE,
-                   0.0,
-                   1/3* MAX_STEERING_ANGLE,
-                   2/3* MAX_STEERING_ANGLE,
-                   MAX_STEERING_ANGLE]
-DIRECTIONS = [-1, #reverse
-              1] #forward
+@dataclass
+class CarlaConfig:
+    coordinate_transform_type: str = "carla_ego"
+    transform_scale_x: float = 1.0
+    transform_scale_y: float = 1.0
+    transform_offset_x: float = 9.8
+    transform_offset_y: float = 0.0
+    transform_swap_xy: bool = True
+    transform_invert_x: bool = True
+    transform_invert_y: bool = False
 
-#@dataclass(frozen=True)
-#class YawAngle:
-#    value: float
-"""
-    Angle of orientation of vehicle, in degrees(float) from 0...360
+@dataclass
+class Vehicle:
+    wheelbase: float= 2.85
+    max_steering: float= 0.44157
+    length: float= 4.98
+    width: float= 1.9
 
-    Class is immutable. Please use randomPose.orientation = YawAngle(180.0) when updating the value.
-    """
-#    def __init__(self, value: float):
-#        if not 0.0 <= value < 360.0:
-#            raise ValueError("Orientation value must be between 0 and 360.")
+    @property
+    def steering_angles(self) -> list[float]:
+        return [
+            -self.max_steering,
+            -2 / 3 * self.max_steering,
+            -1 / 3 * self.max_steering,
+            0.0,
+            1 / 3 * self.max_steering,
+            2 / 3 * self.max_steering,
+            self.max_steering,
+        ]
+    @property
+    def directions(self) -> list[int]:
+        return [-1,
+        1]
 
-#@dataclass()
-#class Pose:
-"""
-    @coordinates: current coordinates of vehicle
-    @yaw: angle of orientation of vehicle, in degrees(float) from 0...360
-    """
-#    coordinates: Coordinate2D
-#    orientation: YawAngle
 
 @dataclass
 class Node:
@@ -65,9 +73,10 @@ class Node:
         return self.g_cost + self.h_cost
 
 @dataclass()
-class GridMap:
-    occupancy: np.ndarray
-    distance: np.ndarray
-    resolution: float
+class GridMap3D:
+    occupancy: np.ndarray | None = None
+    distance: np.ndarray | None = None
+    resolution: float= 0.25
+    theta_resolution: float = math.radians(10)  # vehicle can be positioned in x degree slices per position on the grid map
     origin_x: float = 0.0
     origin_y: float = 0.0

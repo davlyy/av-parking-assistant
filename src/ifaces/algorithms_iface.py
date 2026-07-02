@@ -20,7 +20,7 @@ class PathPlanning(Protocol):
     @final_pose: final pose of vehicle
     returns rough path as list of poses
     """
-    def __call__(self, payload: dict) -> list[Node]:
+    def __call__(self, payload: dict, ego_world_pose: dict, already_world: bool) -> list[Node]:
         ...
 
 #class PathToRoute(Protocol):

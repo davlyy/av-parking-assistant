@@ -7,3 +7,4 @@ networkx
 rsplan
 numpy
 ultralytics
+carla
