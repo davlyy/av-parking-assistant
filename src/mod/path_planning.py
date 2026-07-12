@@ -106,10 +106,11 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
                 "current_dist:", round(dist_to_goal, 2),
             )
 
-        if dist_to_goal < config.goal_tolerance:
+        if is_goal_reached(current, end):
             print("iterations:", iterations)
             print("closed:", len(closed))
             print("best_dist_seen:", best_dist_seen)
+            print("goal_yaw_diff:", yaw_distance(current.theta, end.theta))
             return reconstruct_path(current)
 
         for node in node_expansion(current, gridmap, end):
@@ -191,7 +192,10 @@ def get_coordinate_transform(payload: dict) -> dict:
 
 
 def normalize_parking_slots(payload: dict) -> list[dict]:
-    raw_slots = payload.get("parking_slots", None)
+    raw_slots = payload.get("available_parking_slots", None)
+
+    if raw_slots is None:
+        raw_slots = payload.get("parking_slots", None)
 
     if raw_slots is None:
         raw_slots = payload.get("parking_slot", None)
@@ -204,16 +208,14 @@ def normalize_parking_slots(payload: dict) -> list[dict]:
 
     if not isinstance(raw_slots, list):
         raise TypeError(
-            "'parking_slot' or 'parking_slots' must be either a dict or a list of dicts"
+            "'parking_slot', 'parking_slots' or 'available_parking_slots' must be either a dict or a list of dicts"
         )
 
     slots = []
 
     for i, slot in enumerate(raw_slots):
         if not isinstance(slot, dict):
-            raise TypeError(
-                f"Parking slot at index {i} must be a dict, got {type(slot)}"
-            )
+            raise TypeError(f"Parking slot at index {i} must be a dict, got {type(slot)}")
 
         if not slot.get("free", True):
             continue
@@ -296,13 +298,27 @@ def priority(node: Node) -> float:
     return node.g_cost + config.heuristic_weight * node.h_cost
 
 def reconstruct_path(node):
-    path = []
+    chain = []
 
     while node is not None:
-        path.append(node)
+        chain.append(node)
         node = node.parent
 
-    path.reverse()
+    chain.reverse()
+
+    if not chain:
+        return []
+
+    path = [chain[0]]
+
+    for node in chain[1:]:
+        segment = getattr(node, "segment_points", [])
+
+        if segment:
+            path.extend(segment)
+        else:
+            path.append(node)
+
     return path
 
 def is_inside_search_corridor(node: Node, start: Node, end: Node, margin: float = 8.0) -> bool:
@@ -315,6 +331,20 @@ def is_inside_search_corridor(node: Node, start: Node, end: Node, margin: float 
 
 def heuristic_cost(node: Node, end: Node) -> float:
     return np.hypot(end.x - node.x, end.y - node.y)
+
+def yaw_distance(a: float, b: float) -> float:
+    return abs(normalize_angle(a - b))
+
+
+def is_goal_reached(node: Node, end: Node) -> bool:
+    position_tolerance = float(
+        getattr(config, "planner_goal_tolerance", config.goal_tolerance)
+    )
+
+    position_ok = heuristic_cost(node, end) < position_tolerance
+    yaw_ok = yaw_distance(node.theta, end.theta) < config.goal_yaw_tolerance
+
+    return position_ok and yaw_ok
 
 def world_to_grid(x: float, y: float, gridmap: GridMap3D) -> tuple[int, int]:
     x_idx = int(round((x - gridmap.origin_x) / gridmap.resolution))
@@ -344,6 +374,110 @@ def make_idx(x: float, y: float, theta: float, gridmap: GridMap3D) -> tuple[int,
 def normalize_angle(angle: float) -> float:
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
+def project_world_to_payload_image(payload: dict, x: float, y: float) -> tuple[float, float]:
+    projection = payload.get("projection", {})
+    if projection.get("type") != "homography":
+        raise ValueError("drivable_area image_polygon requires projection.type == 'homography'")
+
+    H = np.array(projection["H_world_to_image"], dtype=np.float64)
+    p = np.array([float(x), float(y), 1.0], dtype=np.float64)
+    q = H @ p
+
+    if abs(q[2]) < 1e-9:
+        return float("inf"), float("inf")
+
+    return float(q[0] / q[2]), float(q[1] / q[2])
+
+
+def project_payload_image_to_world(payload: dict, u: float, v: float) -> tuple[float, float]:
+    projection = payload.get("projection", {})
+    if projection.get("type") != "homography":
+        raise ValueError("drivable_area image_polygon requires projection.type == 'homography'")
+
+    H = np.array(projection["H_world_to_image"], dtype=np.float64)
+    H_inv = np.linalg.inv(H)
+
+    p = np.array([float(u), float(v), 1.0], dtype=np.float64)
+    q = H_inv @ p
+
+    if abs(q[2]) < 1e-9:
+        return float("inf"), float("inf")
+
+    return float(q[0] / q[2]), float(q[1] / q[2])
+
+
+def point_in_polygon(x: float, y: float, polygon: list[list[float]]) -> bool:
+    inside = False
+    n = len(polygon)
+
+    if n < 3:
+        return False
+
+    j = n - 1
+
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+
+        intersects = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-12) + xi
+        )
+
+        if intersects:
+            inside = not inside
+
+        j = i
+
+    return inside
+
+
+def extend_bounds_with_drivable_area(payload: dict, xs: list[float], ys: list[float]) -> None:
+    area = payload.get("drivable_area")
+
+    if not area:
+        return
+
+    if area.get("type") != "image_polygon":
+        raise ValueError("Unsupported drivable_area type")
+
+    for u, v in area.get("points", []):
+        x, y = project_payload_image_to_world(payload, u, v)
+
+        if np.isfinite(x) and np.isfinite(y):
+            xs.append(x)
+            ys.append(y)
+
+
+def apply_drivable_area_mask(payload: dict, gridmap: GridMap3D) -> None:
+    area = payload.get("drivable_area")
+
+    if not area:
+        return
+
+    if area.get("type") != "image_polygon":
+        raise ValueError("Unsupported drivable_area type")
+
+    polygon = area.get("points", [])
+
+    if len(polygon) < 3:
+        raise ValueError("drivable_area.points must contain at least 3 points")
+
+    height_cells, width_cells = gridmap.occupancy.shape
+
+    for y_idx in range(height_cells):
+        for x_idx in range(width_cells):
+            wx = gridmap.origin_x + x_idx * gridmap.resolution
+            wy = gridmap.origin_y + y_idx * gridmap.resolution
+
+            u, v = project_world_to_payload_image(payload, wx, wy)
+
+            if not np.isfinite(u) or not np.isfinite(v):
+                gridmap.occupancy[y_idx, x_idx] = 1
+                continue
+
+            if not point_in_polygon(u, v, polygon):
+                gridmap.occupancy[y_idx, x_idx] = 1
+
 def gridmap_init(payload: dict):
     global gridmap
     margin = 5.0
@@ -368,6 +502,8 @@ def gridmap_init(payload: dict):
         xs.extend([float(slot["x"]) - r, float(slot["x"]) + r])
         ys.extend([float(slot["y"]) - r, float(slot["y"]) + r])
 
+    extend_bounds_with_drivable_area(payload, xs, ys)
+
     gridmap.origin_x = min(xs) - margin
     gridmap.origin_y = min(ys) - margin
 
@@ -381,6 +517,8 @@ def gridmap_init(payload: dict):
     height_cells = int(np.ceil(height_m / gridmap.resolution)) + 1
 
     gridmap.occupancy = np.zeros((height_cells, width_cells), dtype=np.uint8)
+
+    apply_drivable_area_mask(payload, gridmap)
 
     # Helper: world coordinates -> grid indices
     def _world_to_grid_local(x: float, y: float) -> tuple[int, int]:
@@ -434,6 +572,15 @@ def gridmap_init(payload: dict):
         # Fallback: no distance penalty, only hard occupancy collision
         gridmap.distance = np.full_like(gridmap.occupancy, fill_value=999.0, dtype=float)
 
+def is_motion_collision_free(gridmap: GridMap3D, node: Node) -> bool:
+    if not is_collision_free(gridmap, node):
+        return False
+
+    for point in getattr(node, "segment_points", []):
+        if not is_collision_free(gridmap, point):
+            return False
+
+    return True
 
 def is_collision_free(gridmap: GridMap3D, node) -> bool:
     if not is_inside_grid(gridmap, node):
@@ -462,19 +609,54 @@ def is_inside_grid(gridmap: GridMap3D, node) -> bool:
 
     return 0 <= x_idx < width and 0 <= y_idx < height
 
-def node_expansion(current: Node, gridmap: GridMap3D, end:Node) -> list[Node]:
+def rollout_motion(current: Node, steer: float, direction: int, step_length: float, samples: int = 12):
+    x = float(current.x)
+    y = float(current.y)
+    theta = float(current.theta)
+
+    ds = step_length / samples
+    segment_points = []
+
+    for _ in range(samples):
+        x += direction * ds * np.cos(theta)
+        y += direction * ds * np.sin(theta)
+        theta += direction * ds / vehicle.wheelbase * np.tan(steer)
+        theta = normalize_angle(theta)
+
+        segment_points.append(
+            Node(
+                x=x,
+                y=y,
+                theta=theta,
+                idx=(-1, -1, -1),
+                steer=steer,
+                direction=direction,
+                motion_length=ds,
+            )
+        )
+
+    return x, y, theta, segment_points
+
+def node_expansion(current: Node, gridmap: GridMap3D, end: Node) -> list[Node]:
     global vehicle
     children = []
 
+    dist_to_goal = heuristic_cost(current, end)
+
+    if dist_to_goal < config.near_goal_radius:
+        step_length = config.near_goal_dsize
+    else:
+        step_length = config.dsize
+
     for direction in vehicle.directions:
         for steer in vehicle.steering_angles:
-            x_new = current.x + direction * config.dsize * np.cos(current.theta)
-            y_new = current.y + direction * config.dsize * np.sin(current.theta)
-
-            theta_new = current.theta + (
-                direction * config.dsize / vehicle.wheelbase * np.tan(steer)
+            x_new, y_new, theta_new, segment_points = rollout_motion(
+                current=current,
+                steer=steer,
+                direction=direction,
+                step_length=step_length,
+                samples=12,
             )
-            theta_new = normalize_angle(theta_new)
 
             idx_new = make_idx(x_new, y_new, theta_new, gridmap)
 
@@ -485,7 +667,9 @@ def node_expansion(current: Node, gridmap: GridMap3D, end:Node) -> list[Node]:
                 idx=idx_new,
                 parent=current,
                 steer=steer,
-                direction=direction
+                direction=direction,
+                motion_length=step_length,
+                segment_points=segment_points,
             )
 
             children.append(child)
@@ -496,20 +680,35 @@ def transition_cost(current: Node, node: Node, gridmap: GridMap3D) -> float:
     current_steer = float(getattr(current, "steer", 0.0))
     node_steer = float(getattr(node, "steer", 0.0))
 
-    cost_length = config.omega_1 * config.dsize
+    current_direction = int(getattr(current, "direction", 1))
+    node_direction = int(getattr(node, "direction", 1))
+
+    motion_length = float(getattr(node, "motion_length", config.dsize))
+    cost_length = config.omega_1 * motion_length
     cost_steer_change = config.omega_2 * abs(node_steer - current_steer)
     cost_obstacle = config.omega_3 * obstacle_distance_cost(gridmap, node)
 
     max_steer = max(float(vehicle.max_steering), 1e-6)
     normalized_steer = abs(node_steer) / max_steer
 
-    cost_steer_angle = 0.15 * normalized_steer * config.dsize
+    cost_steer_angle = 0.08 * normalized_steer * config.dsize
+
+    cost_reverse = 0.0
+    if node_direction < 0:
+        cost_reverse = config.omega_reverse * config.dsize
+
+    cost_direction_change = 0.0
+
+    if current.parent is not None and current_direction != node_direction:
+        cost_direction_change = config.omega_direction_change
 
     return (
         cost_length
         + cost_steer_change
         + cost_steer_angle
         + cost_obstacle
+        + cost_reverse
+        + cost_direction_change
     )
 
 def obstacle_distance_cost(gridmap: GridMap3D, node: Node) -> float:

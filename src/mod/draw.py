@@ -6,6 +6,41 @@ from typing import Callable
 
 Projector = Callable[[float, float, np.ndarray], tuple[int, int]]
 
+def draw_drivable_area_on_frame(frame, payload: dict) -> None:
+    area = payload.get("drivable_area")
+    if not area:
+        return
+
+    if area.get("type") != "image_polygon":
+        return
+
+    pts = area.get("points", [])
+    if len(pts) < 3:
+        return
+
+    frame_h, frame_w = frame.shape[:2]
+
+    payload_w = float(payload.get("image_width", frame_w))
+    payload_h = float(payload.get("image_height", frame_h))
+
+    sx = frame_w / payload_w
+    sy = frame_h / payload_h
+
+    poly = np.array(
+        [
+            [int(round(u * sx)), int(round(v * sy))]
+            for u, v in pts
+        ],
+        dtype=np.int32,
+    )
+
+    cv2.polylines(
+        frame,
+        [poly],
+        isClosed=True,
+        color=(0, 255, 0),
+        thickness=3,
+    )
 
 def draw_box_on_frame(
     frame,
@@ -50,40 +85,28 @@ def draw_box_on_frame(
     return pts
 
 def get_parking_slots(payload: dict) -> list[dict]:
-    raw_slots = payload.get("parking_slots", None)
+    if "available_parking_slots" in payload:
+        return [
+            {**slot, "id": i}
+            for i, slot in enumerate(payload["available_parking_slots"])
+        ]
 
-    if raw_slots is None:
-        raw_slots = payload.get("parking_slot", None)
+    if "parking_slots" in payload:
+        return [
+            {**slot, "id": slot.get("id", i)}
+            for i, slot in enumerate(payload["parking_slots"])
+            if slot.get("free", True)
+        ]
 
-    if raw_slots is None:
-        return []
+    if "parking_slot" in payload:
+        slot = payload["parking_slot"]
 
-    # altes Format: "parking_slot": {...}
-    if isinstance(raw_slots, dict):
-        raw_slots = [raw_slots]
+        if isinstance(slot, list):
+            return [{**s, "id": i} for i, s in enumerate(slot)]
 
-    # neues Format: "parking_slot": [{...}, {...}]
-    if not isinstance(raw_slots, list):
-        raise TypeError(
-            "'parking_slot' or 'parking_slots' must be either a dict or a list of dicts"
-        )
+        return [{**slot, "id": 0}]
 
-    slots = []
-
-    for i, slot in enumerate(raw_slots):
-        if not isinstance(slot, dict):
-            raise TypeError(f"Parking slot at index {i} is not a dict: {type(slot)}")
-
-        if not slot.get("free", True):
-            continue
-
-        slots.append({
-            **slot,
-            "id": slot.get("id", i),
-            "free": slot.get("free", True),
-        })
-
-    return slots
+    return []
 
 def set_goal_from_slot(payload: dict, slot: dict) -> dict:
     payload = payload.copy()
@@ -318,143 +341,109 @@ def make_slot_overlay_mouse_callback(state: dict):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
-        # 1. Klick auf Overlay-Buttons
-        for idx, (x1, y1, x2, y2) in state.get("buttons", []):
+        scale = state.get("display_scale", 1.0)
+
+        if scale <= 0:
+            scale = 1.0
+
+        x = int(x / scale)
+        y = int(y / scale)
+
+        for idx, rect in state.get("buttons", []):
+            x1, y1, x2, y2 = rect
+
             if x1 <= x <= x2 and y1 <= y <= y2:
                 state["clicked_index"] = idx
-                print("Clicked overlay slot:", idx)
                 return
 
-        # 2. Klick direkt auf gezeichnete Parking-Slot-Box
-        for idx, polygon in state.get("slot_polygons", []):
-            inside = cv2.pointPolygonTest(
-                polygon,
-                (float(x), float(y)),
-                False,
-            )
-
-            if inside >= 0:
+        for idx, poly in state.get("slot_polygons", []):
+            if cv2.pointPolygonTest(poly, (x, y), False) >= 0:
                 state["clicked_index"] = idx
-                print("Clicked parking slot polygon:", idx)
                 return
 
     return on_mouse
 
-def draw_slot_overlay(
-    frame,
-    slots: list[dict],
-    selected_index: int,
-    state: dict,
-) -> None:
-    height, width = frame.shape[:2]
+def draw_slot_overlay(frame, slots: list[dict], selected_index: int, overlay_state: dict) -> None:
+    h, w = frame.shape[:2]
 
-    panel_w = 390
-    panel_x1 = width - panel_w - 20
-    panel_y1 = 20
-    panel_x2 = width - 20
-    panel_y2 = min(height - 20, panel_y1 + 90 + len(slots) * 42)
+    display_scale = float(overlay_state.get("display_scale", 1.0))
+    if display_scale <= 0:
+        display_scale = 1.0
 
-    # dunkles transparentes Panel
+    inv = 1.0 / display_scale
+
+    panel_w = int(min(w * 0.48, 560 * inv))
+    row_h = int(44 * inv)
+    header_h = int(78 * inv)
+    pad = int(16 * inv)
+
+    margin_x = int(18 * inv)
+    margin_y = int(18 * inv)
+
+    panel_h = header_h + len(slots) * row_h + pad
+    x1 = w - panel_w - margin_x
+    y1 = margin_y
+    x2 = w - margin_x
+    y2 = min(h - margin_y, y1 + panel_h)
+
     overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (25, 25, 25), -1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
 
-    cv2.rectangle(
-        overlay,
-        (panel_x1, panel_y1),
-        (panel_x2, panel_y2),
-        (20, 20, 20),
-        thickness=-1,
-    )
-
-    cv2.addWeighted(
-        overlay,
-        0.72,
-        frame,
-        0.28,
-        0,
-        frame,
-    )
-
-    # Rahmen
-    cv2.rectangle(
-        frame,
-        (panel_x1, panel_y1),
-        (panel_x2, panel_y2),
-        (0, 255, 255),
-        thickness=2,
-    )
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), max(2, int(2 * inv)))
 
     cv2.putText(
         frame,
         "Parking slot selection",
-        (panel_x1 + 15, panel_y1 + 30),
+        (x1 + int(16 * inv), y1 + int(34 * inv)),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
+        0.8 * inv,
         (255, 255, 255),
-        2,
+        max(1, int(2 * inv)),
     )
 
     cv2.putText(
         frame,
         "click / 0-9 / W-S / Q",
-        (panel_x1 + 15, panel_y1 + 55),
+        (x1 + int(16 * inv), y1 + int(60 * inv)),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (190, 190, 190),
-        1,
+        0.48 * inv,
+        (210, 210, 210),
+        max(1, int(1 * inv)),
     )
 
-    state["buttons"] = []
+    overlay_state["buttons"] = []
 
-    for idx, slot in enumerate(slots):
-        slot_id = slot.get("id", idx)
+    y = y1 + header_h
 
-        x1 = panel_x1 + 15
-        y1 = panel_y1 + 75 + idx * 42
-        x2 = panel_x2 - 15
-        y2 = y1 + 32
+    for i, slot in enumerate(slots):
+        bx1 = x1 + int(14 * inv)
+        by1 = y
+        bx2 = x2 - int(14 * inv)
+        by2 = y + int(32 * inv)
 
-        state["buttons"].append((idx, (x1, y1, x2, y2)))
+        overlay_state["buttons"].append((i, (bx1, by1, bx2, by2)))
 
-        is_selected = idx == selected_index
+        selected = i == selected_index
+        border = (0, 255, 0) if selected else (120, 120, 120)
+        text_color = (220, 255, 220) if selected else (220, 220, 220)
 
-        if is_selected:
-            fill_color = (40, 90, 40)
-            border_color = (0, 255, 0)
-            text_color = (255, 255, 255)
-            thickness = 2
-        else:
-            fill_color = (55, 55, 55)
-            border_color = (140, 140, 140)
-            text_color = (220, 220, 220)
-            thickness = 1
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (40, 40, 40), -1)
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), border, max(1, int((2 if selected else 1) * inv)))
 
-        cv2.rectangle(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            fill_color,
-            thickness=-1,
-        )
-
-        cv2.rectangle(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            border_color,
-            thickness=thickness,
-        )
-
-        text = f"[{idx}] slot {slot_id}   x={slot['x']:.1f}  y={slot['y']:.1f}"
+        text = f"[{i}] slot {slot.get('id', i)}   x={slot['x']:.1f}   y={slot['y']:.1f}"
 
         cv2.putText(
             frame,
             text,
-            (x1 + 10, y1 + 22),
+            (bx1 + int(10 * inv), by1 + int(22 * inv)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.5 * inv,
             text_color,
-            1,
+            max(1, int(1 * inv)),
         )
+
+        y += row_h
 
 def draw_scene_on_frame(
     frame,
@@ -509,60 +498,60 @@ def draw_scene_on_frame(
         if state is not None:
             state["slot_polygons"].append((i, pts))
 
+def resize_for_display(frame, max_w: int = 1400, max_h: int = 950):
+    h, w = frame.shape[:2]
+    scale = min(max_w / w, max_h / h)
 
-def draw_path_on_frame(
-    frame,
-    path,
-    project: Projector,
-    color: tuple[int, int, int] = (0, 0, 255),
-    thickness: int = 2,
-    stride: int = 1,
-    goal_pose: dict | None = None,
-) -> None:
+    if scale <= 0:
+        scale = 1.0
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    return resized, scale
+
+def draw_path_to_goal_on_frame(frame, path, project, goal_pose: dict, color=(0, 0, 255), thickness: int = 2, stride: int = 1) -> None:
     if not path:
         return
 
-    points = []
+    sampled_path = list(path[::stride])
 
-    for node in path[::stride]:
-        u, v = project(float(node.x), float(node.y), frame)
-        points.append((u, v))
+    if sampled_path[-1] is not path[-1]:
+        sampled_path.append(path[-1])
 
-    # Visuell bis zur echten Parkplatzmitte weiterzeichnen
-    if goal_pose is not None:
-        goal_point = project(
-            float(goal_pose["x"]),
-            float(goal_pose["y"]),
-            frame,
-        )
+    points = [
+        project(float(node.x), float(node.y), frame)
+        for node in sampled_path
+    ]
 
-        if not points or points[-1] != goal_point:
-            points.append(goal_point)
+    if len(points) >= 2:
+        for i in range(len(points) - 1):
+            direction = int(getattr(sampled_path[i + 1], "direction", 1))
+            segment_color = (0, 0, 255) if direction > 0 else (0, 165, 255)
 
-    if len(points) < 2:
-        return
+            cv2.line(
+                frame,
+                points[i],
+                points[i + 1],
+                segment_color,
+                thickness,
+            )
 
-    pts = np.array(points, dtype=np.int32)
+    goal_point = project(float(goal_pose["x"]), float(goal_pose["y"]), frame)
 
-    cv2.polylines(
-        frame,
-        [pts],
-        isClosed=False,
-        color=color,
-        thickness=thickness,
-    )
+    if points:
+        cv2.circle(frame, points[0], 6, (0, 255, 0), -1)
+        cv2.circle(frame, points[-1], 5, (255, 255, 255), -1)
 
-    # Startpunkt
-    cv2.circle(frame, points[0], 6, (0, 255, 0), thickness=-1)
-
-    # Zielpunkt = Parkplatzmitte
-    cv2.circle(frame, points[-1], 7, (255, 0, 255), thickness=-1)
-    cv2.circle(frame, points[-1], 11, (255, 255, 255), thickness=2)
+    cv2.circle(frame, goal_point, 7, (255, 0, 255), -1)
+    cv2.circle(frame, goal_point, 11, (255, 255, 255), 2)
 
     cv2.putText(
         frame,
         "GOAL",
-        (points[-1][0] + 8, points[-1][1] - 8),
+        (goal_point[0] + 8, goal_point[1] - 8),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
         (255, 0, 255),
@@ -658,128 +647,53 @@ def make_carla_camera_projector(camera, ground_z: float = 0.1):
 
     return project_carla_camera
 
-def make_projector(
-    config: SourceConfig,
-    payload: dict | None = None,
-    source=None,
-):
+def identity(x: float, y: float, frame):
+    return int(round(x)), int(round(y))
+
+def make_projector(config, payload: dict | None = None, source=None):
     payload = payload or {}
     projection = payload.get("projection")
 
-    # ------------------------------------------------------------
-    # 1. Payload-Projektion: echte Welt / Homography
-    # ------------------------------------------------------------
     if projection is not None:
         projection_type = projection.get("type") or projection.get("mode")
 
         if projection_type == "homography":
-            if "H_world_to_image" in projection:
-                H = np.array(
-                    projection["H_world_to_image"],
-                    dtype=np.float64,
-                )
+            H = np.array(projection["H_world_to_image"], dtype=np.float64)
 
-                if H.shape != (3, 3):
-                    raise ValueError(
-                        f"H_world_to_image must be a 3x3 matrix, got shape {H.shape}"
-                    )
+            payload_image_width = float(payload.get("image_width", 0.0))
+            payload_image_height = float(payload.get("image_height", 0.0))
 
-                def project_homography(x: float, y: float, frame):
-                    point = np.array(
-                        [float(x), float(y), 1.0],
-                        dtype=np.float64,
-                    )
+            def project_homography(x: float, y: float, frame):
+                p = np.array([float(x), float(y), 1.0], dtype=np.float64)
+                q = H @ p
 
-                    projected = H @ point
+                if abs(q[2]) < 1e-9:
+                    return -999999, -999999
 
-                    if abs(projected[2]) < 1e-9:
-                        return -999999, -999999
+                u = q[0] / q[2]
+                v = q[1] / q[2]
 
-                    u = projected[0] / projected[2]
-                    v = projected[1] / projected[2]
+                frame_h, frame_w = frame.shape[:2]
 
-                    return int(round(u)), int(round(v))
+                if payload_image_width > 0 and payload_image_height > 0:
+                    u *= frame_w / payload_image_width
+                    v *= frame_h / payload_image_height
 
-                return project_homography
+                return int(round(u)), int(round(v))
 
-            if "world_points" in projection and "image_points" in projection:
-                world_points = np.array(
-                    projection["world_points"],
-                    dtype=np.float32,
-                )
+            return project_homography
 
-                image_points = np.array(
-                    projection["image_points"],
-                    dtype=np.float32,
-                )
-
-                if len(world_points) < 4 or len(image_points) < 4:
-                    raise ValueError(
-                        "Homography needs at least 4 world_points and 4 image_points"
-                    )
-
-                H, _ = cv2.findHomography(world_points, image_points)
-
-                if H is None:
-                    raise RuntimeError("Could not compute homography")
-
-                def project_homography_points(x: float, y: float, frame):
-                    point = np.array(
-                        [[[float(x), float(y)]]],
-                        dtype=np.float32,
-                    )
-
-                    projected = cv2.perspectiveTransform(point, H)
-
-                    u = projected[0, 0, 0]
-                    v = projected[0, 0, 1]
-
-                    return int(round(u)), int(round(v))
-
-                return project_homography_points
-
-            raise ValueError(
-                "Homography projection requires either 'H_world_to_image' "
-                "or both 'world_points' and 'image_points'"
-            )
-
-        # Optionaler Debug-/Fallback-Modus für perfekte Top-Down-Ansichten
         if projection_type == "bounds":
             return make_bounds_projector(projection)
 
-    # ------------------------------------------------------------
-    # 2. CARLA: echte Kamera-Projektion verwenden
-    # ------------------------------------------------------------
     if config.source_type == "carla" and source is not None:
         camera = getattr(source, "_camera", None)
 
         if camera is not None:
-            ground_z = float(
-                payload.get("projection", {}).get("ground_z", 0.1)
-            )
+            ground_z = float(payload.get("projection", {}).get("ground_z", 0.1))
+            return make_carla_camera_projector(camera=camera, ground_z=ground_z)
 
-            return make_carla_camera_projector(
-                camera=camera,
-                ground_z=ground_z,
-            )
-
-    # ------------------------------------------------------------
-    # 3. Letzter CARLA-Fallback: alte boundary-Projektion
-    #    Nur benutzen, wenn du wirklich eine perfekte Top-Down-Karte hast.
-    # ------------------------------------------------------------
-    if config.source_type == "carla" and config.carla is not None:
-        def project_carla_bounds(x: float, y: float, frame):
-            return carla_world_to_pixel(x, y, frame, config)
-
-        return project_carla_bounds
-
-    # ------------------------------------------------------------
-    # 4. Fallback für Pixel-Koordinaten
-    # ------------------------------------------------------------
-    def project_identity(x: float, y: float, frame):
-        return int(round(x)), int(round(y))
-
-    return project_identity
+    return identity
 
 def box_to_pixel_polygon(
     box: dict,

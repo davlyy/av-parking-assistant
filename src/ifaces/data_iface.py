@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import numpy as np
 
@@ -8,18 +8,25 @@ Coordinate2D = tuple[int, int]
 @dataclass()
 class Config:
     dsize: float = 1.0
-    omega_1 = 0.5  # distance cost
-    omega_2 = 0.5  # steer change cost
-    omega_3 = 5.0  # obstacle distance cost
+    omega_1 = 0.5
+    omega_2 = 0.5
+    omega_3 = 5.0
     d0 = 1.5
     epsilon = 0.1
     heuristic_weight = 1.5
     search_margin: float = 20.0
+
     goal_tolerance: float = 1.2
+    planner_goal_tolerance: float = 0.45
+    goal_yaw_tolerance: float = math.radians(20)
+
+    near_goal_radius: float = 3.0
+    near_goal_dsize: float = 0.4
+
     max_iterations: int = 200000
     omega_steer_angle: float = 2.0
-    omega_reverse: float = 0.2
-    omega_direction_change: float = 2.0
+    omega_reverse: float = 0.0
+    omega_direction_change: float = 1.5
 
 @dataclass
 class CarlaConfig:
@@ -67,6 +74,8 @@ class Node:
     h_cost: float = 0.0
     steer: float = 0.0
     direction: int = 1
+    motion_length: float = 1.0
+    segment_points: list = field(default_factory=list)
 
     @property
     def f_cost(self):

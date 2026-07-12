@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
-from typing import Literal, get_type_hints, Any
+from typing import Literal, get_type_hints
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,11 @@ class CameraSetup:
     height: int = 720
     fps: int = 30
     calibration: CameraCalibration | None = None
+
+
+@dataclass(frozen=True)
+class ImageConfig:
+    path: str
 
 
 @dataclass(frozen=True)
@@ -87,7 +92,7 @@ class CarlaConfig:
     camera: CarlaCameraConfig | None = None
 
 
-SourceType = Literal["camera", "carla"]
+SourceType = Literal["camera", "carla", "image"]
 
 
 @dataclass(frozen=True)
@@ -95,28 +100,34 @@ class SourceConfig:
     source_type: SourceType
     camera: CameraSetup | None = None
     carla: CarlaConfig | None = None
+    image: ImageConfig | None = None
 
 
 def _dict_to_dataclass(d: dict, cls):
     if d is None:
         return None
+
     hints = get_type_hints(cls)
+
     from dataclasses import fields
     field_names = {f.name for f in fields(cls)}
+
     kwargs = {}
+
     for k, v in d.items():
-        if k in field_names and k in hints:
-            ft = hints[k]
-            origin = getattr(ft, "__origin__", None)
-            if origin is not None:
-                if origin is dict:
-                    kwargs[k] = v
-                else:
-                    kwargs[k] = v
-            elif hasattr(ft, "__dataclass_fields__"):
-                kwargs[k] = _dict_to_dataclass(v, ft) if isinstance(v, dict) else v
-            else:
-                kwargs[k] = v
+        if k not in field_names or k not in hints:
+            continue
+
+        ft = hints[k]
+        origin = getattr(ft, "__origin__", None)
+
+        if hasattr(ft, "__dataclass_fields__"):
+            kwargs[k] = _dict_to_dataclass(v, ft) if isinstance(v, dict) else v
+        elif origin is dict:
+            kwargs[k] = v
+        else:
+            kwargs[k] = v
+
     return cls(**kwargs)
 
 
@@ -124,6 +135,7 @@ def _parse_scenario(raw: dict) -> CarlaScenarioConfig:
     ego = raw.get("ego_vehicle", {})
     sp = ego.get("spawn_point")
     bd = raw.get("boundaries")
+
     return CarlaScenarioConfig(
         map=raw.get("map", "Town01"),
         weather=raw.get("weather", "ClearNoon"),
@@ -145,17 +157,23 @@ def _pick(raw: dict, *keys: str) -> dict | None:
 
 def load_config(path: str | Path) -> SourceConfig:
     path = Path(path)
+
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
+
     raw = json.loads(path.read_text(encoding="utf-8"))
     source_type = raw.get("source_type", "camera")
 
     camera = None
     carla = None
+    image = None
+
     if source_type == "camera":
         cam = _pick(raw, "Camera", "camera")
+
         if cam:
             calib = cam.get("calibration")
+
             camera = CameraSetup(
                 device_id=cam.get("device_id", 0),
                 width=cam.get("width", 1280),
@@ -163,12 +181,24 @@ def load_config(path: str | Path) -> SourceConfig:
                 fps=cam.get("fps", 30),
                 calibration=_dict_to_dataclass(calib, CameraCalibration) if calib else None,
             )
+
+    elif source_type == "image":
+        img = _pick(raw, "Image", "image")
+
+        if img:
+            image = ImageConfig(
+                path=img["path"],
+            )
+
     elif source_type == "carla":
         crl = _pick(raw, "Carla", "carla")
+
         if crl:
             cam_cfg = crl.get("camera")
             raw_scenarios = crl.get("scenarios", {})
+
             scenarios: dict[str, CarlaScenarioConfig] = {}
+
             for name, s in raw_scenarios.items():
                 if isinstance(s, dict):
                     scenarios[name] = _parse_scenario(s)
@@ -185,4 +215,12 @@ def load_config(path: str | Path) -> SourceConfig:
                 camera=_dict_to_dataclass(cam_cfg, CarlaCameraConfig) if cam_cfg else None,
             )
 
-    return SourceConfig(source_type=source_type, camera=camera, carla=carla)
+    else:
+        raise ValueError(f"Unsupported source_type: {source_type}")
+
+    return SourceConfig(
+        source_type=source_type,
+        camera=camera,
+        carla=carla,
+        image=image,
+    )

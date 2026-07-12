@@ -10,16 +10,19 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-from input import load_config, CameraSource, CarlaSource, SourceConfig
+from input import load_config, CameraSource, CarlaSource, ImageSource, SourceConfig
 from mod.path_planning import convert_payload_to_carla_world, plan_path
 from mod.draw import (
     draw_box_on_frame,
     draw_scene_on_frame,
     draw_slot_overlay,
+    draw_path_to_goal_on_frame,
     get_parking_slots,
     make_projector,
     make_slot_overlay_mouse_callback,
     set_goal_from_slot,
+    resize_for_display,
+    draw_drivable_area_on_frame
 )
 
 
@@ -29,9 +32,17 @@ def create_source(config: SourceConfig):
             raise ValueError("CARLA config missing")
         return CarlaSource(config.carla)
 
-    if config.camera is None:
-        raise ValueError("Camera config missing")
-    return CameraSource(config.camera)
+    if config.source_type == "camera":
+        if config.camera is None:
+            raise ValueError("Camera config missing")
+        return CameraSource(config.camera)
+
+    if config.source_type == "image":
+        if config.image is None:
+            raise ValueError("Image config missing")
+        return ImageSource(config.image)
+
+    raise ValueError(f"Unknown source_type: {config.source_type}")
 
 
 def ensure_bgr(frame):
@@ -122,31 +133,6 @@ def trim_path_for_display(path, current_pose: dict | None, progress_index: int):
     current_node = SimpleNamespace(x=float(current_pose["x"]), y=float(current_pose["y"]))
     return [current_node] + remaining
 
-
-def draw_path_to_goal_on_frame(frame, path, project, goal_pose: dict, color=(0, 0, 255), thickness: int = 2, stride: int = 1) -> None:
-    if not path:
-        return
-
-    points = [project(float(node.x), float(node.y), frame) for node in path[::stride]]
-
-    last_path_point = project(float(path[-1].x), float(path[-1].y), frame)
-    if not points or points[-1] != last_path_point:
-        points.append(last_path_point)
-
-    goal_point = project(float(goal_pose["x"]), float(goal_pose["y"]), frame)
-    if not points or points[-1] != goal_point:
-        points.append(goal_point)
-
-    if len(points) < 2:
-        return
-
-    cv2.polylines(frame, [np.array(points, dtype=np.int32)], False, color, thickness)
-    cv2.circle(frame, points[0], 6, (0, 255, 0), -1)
-    cv2.circle(frame, goal_point, 7, (255, 0, 255), -1)
-    cv2.circle(frame, goal_point, 11, (255, 255, 255), 2)
-    cv2.putText(frame, "GOAL", (goal_point[0] + 8, goal_point[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-
-
 def draw_top_status_banner(frame, text: str, color=(0, 255, 0)) -> None:
     _, width = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -209,7 +195,12 @@ def run(source, config: SourceConfig, payload: dict) -> None:
         path_replan_deviation = 0.5
         goal_tolerance = get_planner_goal_tolerance(default=3.0)
 
-        overlay_state = {"buttons": [], "slot_polygons": [], "clicked_index": None}
+        overlay_state = {
+            "buttons": [],
+            "slot_polygons": [],
+            "clicked_index": None,
+            "display_scale": 1.0,
+        }
 
         window_name = "AV Parking Assistant"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -293,6 +284,13 @@ def run(source, config: SourceConfig, payload: dict) -> None:
                 path = plan_path(planning_payload, already_world=True)
                 print("Path length:", len(path) if path else 0)
 
+                if path:
+                    reverse_count = sum(1 for node in path if getattr(node, "direction", 1) < 0)
+                    forward_count = sum(1 for node in path if getattr(node, "direction", 1) > 0)
+
+                    print("Forward nodes:", forward_count)
+                    print("Reverse nodes:", reverse_count)
+
                 planned_slot_index = selected_slot_index
                 path_progress_index = 0
 
@@ -306,6 +304,10 @@ def run(source, config: SourceConfig, payload: dict) -> None:
             parked_slot_index = selected_slot_index if parked else None
 
             display_frame = frame.copy()
+            draw_drivable_area_on_frame(display_frame, planning_payload if planning_payload else base_payload)
+
+            _, display_scale = resize_for_display(display_frame, max_w=1400, max_h=950)
+            overlay_state["display_scale"] = display_scale
 
             draw_scene_on_frame(display_frame, base_payload, slots, selected_slot_index, project, overlay_state)
 
@@ -333,6 +335,7 @@ def run(source, config: SourceConfig, payload: dict) -> None:
             if parked_slot_index is not None:
                 draw_top_status_banner(display_frame, "PARKED", color=(0, 255, 0))
 
+            display_frame, display_scale = resize_for_display(display_frame, max_w=1400, max_h=950)
             cv2.imshow(window_name, display_frame)
 
     finally:
@@ -342,7 +345,7 @@ def run(source, config: SourceConfig, payload: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AV Parking Assistant")
-    parser.add_argument("--source", choices=["camera", "carla"], default="camera")
+    parser.add_argument("--source", choices=["camera", "carla", "image"], default="camera")
     parser.add_argument("--config", type=str, default=str(Path(__file__).resolve().parent.parent / "config" / "config.json"))
     parser.add_argument("--scenario", type=str, default="scenario_1")
     args = parser.parse_args()
