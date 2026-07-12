@@ -5,7 +5,10 @@ from pathlib import Path
 import os
 import json
 
-from inference_sdk import InferenceHTTPClient
+from inference_sdk import InferenceConfiguration, InferenceHTTPClient
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
@@ -95,8 +98,54 @@ def estimate_yaw(pred):
 def dist(a, b):
     return np.hypot(a['x'] - b['x'], a['y'] - b['y'])
 
-#[Stage 0] Camera Calibration / IPM Transform
-#TODO: Implement Camera Calibration
+#[Stage 0] White Paper Detection and Crop
+def _order_quad_points(points):
+    """Order quadrilateral vertices as top-left, top-right, bottom-right, bottom-left."""
+    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    ordered = np.empty((4, 2), dtype=np.float32)
+    sums = points.sum(axis=1)
+    diffs = np.diff(points, axis=1).ravel()
+    ordered[0] = points[np.argmin(sums)]
+    ordered[2] = points[np.argmax(sums)]
+    ordered[1] = points[np.argmin(diffs)]
+    ordered[3] = points[np.argmax(diffs)]
+    return ordered
+
+
+def find_white_sheet_corners(frame):
+    """Find the four corners of the white paper sheet using relaxed HSV bounds."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Paper remains bright with low saturation even under uneven lighting.
+    # The upper saturation bound is deliberately relaxed for warm shadows.
+    paper_mask = cv2.inRange(hsv, (0, 0, 120), (180, 130, 255))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+    paper_mask = cv2.morphologyEx(paper_mask, cv2.MORPH_CLOSE, kernel)
+    paper_mask = cv2.morphologyEx(paper_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(paper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("Could not locate the white paper sheet in the frame")
+
+    paper_contour = max(contours, key=cv2.contourArea)
+    min_area = frame.shape[0] * frame.shape[1] * 0.12
+    if cv2.contourArea(paper_contour) < min_area:
+        raise ValueError("Detected paper sheet is too small; ensure the complete sheet is visible")
+    return _order_quad_points(cv2.boxPoints(cv2.minAreaRect(paper_contour)))
+
+
+def detect_and_crop_parking_mat(frame):
+    """Crop to the detected white paper sheet without perspective warping.
+
+    The returned image is an axis-aligned crop of the paper-sheet bounds. The
+    quadrilateral is detected for future perspective correction, but no
+    ``getPerspectiveTransform`` or ``warpPerspective`` is applied here.
+    """
+    corners = find_white_sheet_corners(frame)
+    x1, y1 = np.floor(corners.min(axis=0)).astype(int)
+    x2, y2 = np.ceil(corners.max(axis=0)).astype(int)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+    return frame[y1:y2, x1:x2].copy()
 
 #[Stage 1] Preprocessing
 def preprocess(img):
@@ -312,6 +361,10 @@ def detect_vehicles(frame):
     predictions = api_result.get('predictions', [])
     print(f"[Debug] Roboflow raw predictions: {len(predictions)}")
 
+    print("**"*60)
+    print(predictions)
+    print("**" * 60)
+
     cars  = []
     avail = []
 
@@ -323,7 +376,6 @@ def detect_vehicles(frame):
             'height':     pred['height'],
             'conf':       pred['confidence'],
             'class':      pred['class'],
-            # Derived fields for downstream use
             'center_px':  (pred['x'], pred['y']),
             'size_px':    (pred['width'], pred['height']),
             'bbox_px': (
@@ -344,27 +396,56 @@ def detect_vehicles(frame):
     return cars, avail, predictions
 
 #[Stage 4]: Identify Ego Vehicle
-def identify_ego(cars, avail):
+def identify_ego(cars, frame):
     """
-    Ego vehicle = the car driving in the aisle.
-    Heuristic: car furthest from any available slot center.
+    Ego vehicle = the detected car with the strongest average red colour.
+
+    For each Roboflow car bounding box, calculate the mean BGR pixel colour
+    and score red dominance as R / (B + G + 1). The red toy car therefore has
+    the highest score even when it is not the furthest car from a free slot.
     """
     if not cars:
         return None, []
 
-    if not avail:
-        # No slots detected — pick car closest to image center as ego
-        return cars[0], cars[1:]
+    def redness_score(car):
+        x1, y1, x2, y2 = car['bbox_px']
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        b, g, r, _ = cv2.mean(frame[y1:y2, x1:x2])
+        return r / (b + g + 1.0)
 
-    def dist_to_nearest_slot(car):
-        return min(dist(car, s) for s in avail)
-
-    ego       = max(cars, key=dist_to_nearest_slot)
+    ego       = max(cars, key=redness_score)
     obstacles = [c for c in cars if c is not ego]
     return ego, obstacles
 
+
+def remove_slots_containing_ego(avail, ego):
+    """Remove free-slot detections that fully contain the red ego car box."""
+    if ego is None:
+        return avail
+
+    car_x1, car_y1, car_x2, car_y2 = ego['bbox_px']
+    free_slots = []
+    occupied_slots = 0
+    for slot in avail:
+        slot_x1, slot_y1, slot_x2, slot_y2 = slot['bbox_px']
+        contains_entire_car = (
+            slot_x1 <= car_x1 and slot_y1 <= car_y1 and
+            slot_x2 >= car_x2 and slot_y2 >= car_y2
+        )
+        if contains_entire_car:
+            occupied_slots += 1
+        else:
+            free_slots.append(slot)
+
+    if occupied_slots:
+        print(f"[Debug] Removed {occupied_slots} free-slot prediction(s) containing the ego car")
+    return free_slots
+
 #[Stage 5]: Build A* JSON Payload
-def build_astar_payload(ego, obstacles, avail):
+def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None, image_height=None):
     """
     Converts pixel-space detections to metric A* payload.
     Target slot = available slot closest to ego vehicle.
@@ -373,13 +454,44 @@ def build_astar_payload(ego, obstacles, avail):
         print("[Warn] Cannot build payload: missing ego or available slots")
         return None
 
-    target_slot = min(avail, key=lambda s: dist(s, ego))
+    # The first entry remains the A* goal; retain every other free-space
+    # detection for callers that want to choose an alternative goal.
+    ordered_slots = sorted(avail, key=lambda s: dist(s, ego))
+    target_slot = ordered_slots[0]
+
+    def slot_to_payload(slot):
+        slot_x, slot_y = px_to_metric(slot['x'], slot['y'])
+        slot_w, slot_h = size_to_metric(slot['width'], slot['height'])
+        return {
+            "x":      slot_x,
+            "y":      slot_y,
+            "yaw":    estimate_yaw(slot),
+            "length": round(max(slot_w, slot_h), 3),
+            "width":  round(min(slot_w, slot_h), 3)
+        }
 
     ego_x,  ego_y  = px_to_metric(ego['x'], ego['y'])
     goal_x, goal_y = px_to_metric(target_slot['x'], target_slot['y'])
-    slot_w, slot_h = size_to_metric(target_slot['width'], target_slot['height'])
+
+    image_width = image_width if image_width is not None else 0
+    image_height = image_height if image_height is not None else 0
+    # World coordinates in this payload are metres derived from x_px / ppm and
+    # y_px / ppm. This is the corresponding metric-to-image homography for the
+    # current cropped image coordinate system.
+    world_to_image = [
+        [round(PIXELS_PER_METER, 6), 0.0, 0.0],
+        [0.0, round(PIXELS_PER_METER, 6), 0.0],
+        [0.0, 0.0, 1.0],
+    ]
 
     payload = {
+        "frame_id": frame_id,
+        "image_width": image_width,
+        "image_height": image_height,
+        "projection": {
+            "type": "homography",
+            "H_world_to_image": world_to_image,
+        },
         "start_pose": {
             "x":   ego_x,
             "y":   ego_y,
@@ -404,9 +516,12 @@ def build_astar_payload(ego, obstacles, avail):
             "x":      goal_x,
             "y":      goal_y,
             "yaw":    estimate_yaw(target_slot),
-            "length": round(max(slot_w, slot_h), 3),
-            "width":  round(min(slot_w, slot_h), 3)
+            "length": slot_to_payload(target_slot)["length"],
+            "width":  slot_to_payload(target_slot)["width"]
         },
+        "available_parking_slots": [
+            slot_to_payload(slot) for slot in ordered_slots
+        ],
         "vehicle": VEHICLE_SPEC
     }
 
@@ -471,24 +586,99 @@ def draw_detections(img, lines, slots, rejected_slots, corners,
 
     return vis
 
-def process_frame(frame):
+def _save_debug_image(debug_dir, name, image):
+    """Save one pipeline stage and print its path."""
+    output_path = Path(debug_dir) / name
+    cv2.imwrite(str(output_path), image)
+    print(f"[Debug] Saved {output_path}")
+
+
+def _draw_line_detection(frame, lines, merged_h, merged_v, slots, rejected_slots, corners):
+    """Visualize raw/merged line geometry before model inference."""
+    vis = frame.copy()
+    if lines is not None:
+        for x1, y1, x2, y2 in lines.reshape(-1, 4):
+            cv2.line(vis, (x1, y1), (x2, y2), (255, 0, 0), 1)
+    for x1, y1, x2, y2 in merged_h + merged_v:
+        cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+    for tl, br in slots:
+        cv2.rectangle(vis, tuple(map(int, tl)), tuple(map(int, br)), (0, 255, 0), 2)
+    for tl, br in rejected_slots:
+        cv2.rectangle(vis, tuple(map(int, tl)), tuple(map(int, br)), (0, 0, 255), 1)
+    for x, y in corners:
+        cv2.circle(vis, (int(x), int(y)), 4, (255, 0, 255), -1)
+    return vis
+
+
+def _draw_raw_predictions(frame, raw_predictions):
+    """Visualize every Roboflow prediction before ego/obstacle assignment."""
+    vis = frame.copy()
+    for prediction in raw_predictions:
+        x, y = prediction['x'], prediction['y']
+        width, height = prediction['width'], prediction['height']
+        x1, y1 = int(x - width / 2), int(y - height / 2)
+        x2, y2 = int(x + width / 2), int(y + height / 2)
+        label = prediction['class']
+        confidence = prediction['confidence']
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 255, 0), 2)
+        cv2.putText(vis, f"{label} {confidence:.2f}", (x1, max(15, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+    return vis
+
+
+def _draw_ego_selection(frame, cars, ego, obstacles):
+    """Show the red-colour ego decision before payload generation."""
+    vis = frame.copy()
+    for car in cars:
+        x1, y1, x2, y2 = car['bbox_px']
+        color = (0, 165, 255) if car is ego else (0, 0, 255)
+        label = "EGO" if car is ego else "OBSTACLE"
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(vis, label, (x1, max(15, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    return vis
+
+
+def process_frame(frame, debug_dir=None, frame_id=0):
     global PIXELS_PER_METER
+
+    if debug_dir:
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+    # Stage 0: Detect the white paper sheet and crop it without warping.
+    frame = detect_and_crop_parking_mat(frame)
+    if debug_dir:
+        _save_debug_image(debug_dir, "stage_0_paper_crop.png", frame)
 
     # Stage 1: Preprocess
     gray, hsv = preprocess(frame)
+    if debug_dir:
+        _save_debug_image(debug_dir, "stage_1_gray.png", gray)
+        _save_debug_image(debug_dir, "stage_1_hsv.png", cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
 
     # Stage 2: Lane line detection → slot geometry
     lines = detect_slot_lines(gray, frame)
     merged_h, merged_v, slots, rejected_slots, corners = \
         cluster_lines_to_slots(lines)
+    if debug_dir:
+        _save_debug_image(debug_dir, "stage_2_line_slots.png",
+                          _draw_line_detection(frame, lines, merged_h, merged_v,
+                                               slots, rejected_slots, corners))
 
     # Stage 3: Roboflow detection → cars + available slots
     cars, avail, raw_preds = detect_vehicles(frame)
+    if debug_dir:
+        _save_debug_image(debug_dir, "stage_3_roboflow.png",
+                          _draw_raw_predictions(frame, raw_preds))
 
     # Stage 4: Identify ego vs obstacles
-    ego, obstacles = identify_ego(cars, avail)
+    ego, obstacles = identify_ego(cars, frame)
+    avail = remove_slots_containing_ego(avail, ego)
     print(f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
           f"Obstacles: {len(obstacles)} | Available: {len(avail)}")
+    if debug_dir:
+        _save_debug_image(debug_dir, "stage_4_ego.png",
+                          _draw_ego_selection(frame, cars, ego, obstacles))
 
     # Stage 4b: Calibrate px/m from ego vehicle bbox
     if ego is not None:
@@ -499,15 +689,113 @@ def process_frame(frame):
         PIXELS_PER_METER = 17.6
 
     # Stage 5: Build A* payload
-    payload = build_astar_payload(ego, obstacles, avail)
+    payload = build_astar_payload(
+        ego, obstacles, avail,
+        frame_id=frame_id,
+        image_width=frame.shape[1],
+        image_height=frame.shape[0],
+    )
 
     # Visualization
     result = draw_detections(
         frame, lines, slots, rejected_slots, corners,
         cars, avail, ego, obstacles, merged_h, merged_v
     )
+    if debug_dir:
+        _save_debug_image(debug_dir, "stage_5_final.png", result)
 
     return result, payload
+
+
+def test_model(frame):
+    """Run only Stages 3, 4, and 4b on an input image.
+
+    This is intended for validating the Roboflow model labels and ego-car
+    selection without crop, perspective, line, slot, or payload processing.
+    """
+    global PIXELS_PER_METER
+
+    # Stage 3: Roboflow detection → cars + available slots
+    cars, avail, raw_preds = detect_vehicles(frame)
+
+    # Stage 4: Identify red ego vehicle
+    ego, obstacles = identify_ego(cars, frame)
+    print(f"[Test model] Ego: {ego['class'] if ego else 'None'} | "
+          f"Obstacles: {len(obstacles)} | Available: {len(avail)}")
+
+    # Stage 4b: Calibrate from the selected ego detection
+    if ego is not None:
+        PIXELS_PER_METER = calibrate_from_ego(ego)
+    else:
+        print("[Test model] No ego vehicle detected — calibration skipped.")
+        PIXELS_PER_METER = None
+
+    # No Stage 5 payload is created in model-test mode.
+    result = draw_detections(
+        frame, None, [], [], [], cars, avail, ego, obstacles
+    )
+    return result
+
+
+def process_video(input_path, output_path, sample_fps, payload_path):
+    """Process a video at ``sample_fps`` and write annotated video + payloads."""
+    capture = cv2.VideoCapture(input_path)
+    if not capture.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {input_path}")
+
+    source_fps = capture.get(cv2.CAP_PROP_FPS)
+    if source_fps <= 0:
+        capture.release()
+        raise ValueError("Video does not report a valid FPS")
+    if sample_fps <= 0:
+        capture.release()
+        raise ValueError("--fps must be greater than zero")
+
+    frame_id = 0
+    next_sample_time = 0.0
+    writer = None
+    output_size = None
+    payloads = []
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            timestamp = frame_id / source_fps
+            if timestamp + 1e-9 < next_sample_time:
+                frame_id += 1
+                continue
+
+            result, payload = process_frame(frame, debug_dir=None, frame_id=frame_id)
+            if writer is None:
+                height, width = result.shape[:2]
+                output_size = (width, height)
+                writer = cv2.VideoWriter(
+                    output_path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    sample_fps,
+                    output_size,
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"Cannot create output video: {output_path}")
+            if result.shape[1] != output_size[0] or result.shape[0] != output_size[1]:
+                result = cv2.resize(result, output_size)
+            writer.write(result)
+            if payload:
+                payloads.append(payload)
+
+            next_sample_time += 1.0 / sample_fps
+            frame_id += 1
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+
+    with open(payload_path, "w") as payload_file:
+        json.dump({"source_fps": source_fps, "sample_fps": sample_fps, "frames": payloads}, payload_file, indent=2)
+    print(f"\nProcessed {len(payloads)} sampled video frames")
+    print(f"Annotated video saved to: {output_path}")
+    print(f"Video payloads saved to: {payload_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -515,13 +803,41 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", type=str, required=True)
     parser.add_argument("--payload", type=str, default="payload.json",
                         help="Path to save A* JSON payload")
+    parser.add_argument("--debug-dir", type=str, default="debug_frames",
+                        help="Directory for images saved after every pipeline stage")
+    parser.add_argument("--test-model", action="store_true",
+                        help="Run only Roboflow detection, ego selection, and calibration")
+    parser.add_argument("--confidence", type=float, default=0.1,
+                        help="Roboflow confidence threshold from 0.0 to 1.0; lower returns more candidate boxes")
+    parser.add_argument("--fps", type=float, default=1.0,
+                        help="Video processing rate in sampled frames per second")
     args = parser.parse_args()
+
+    if args.confidence is not None:
+        if not 0.0 <= args.confidence <= 1.0:
+            parser.error("--confidence must be between 0.0 and 1.0")
+        roboflow_client.configure(
+            InferenceConfiguration(confidence_threshold=args.confidence)
+        )
+        print(f"[Debug] Roboflow confidence threshold: {args.confidence:.3f}")
+
+    video_extensions = {".avi", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
+    is_video = Path(args.input).suffix.lower() in video_extensions
+    if is_video:
+        if args.test_model:
+            parser.error("--test-model currently accepts images only")
+        process_video(args.input, args.output, args.fps, args.payload)
+        raise SystemExit(0)
 
     frame = cv2.imread(args.input)
     if frame is None:
         raise FileNotFoundError(f"Cannot read image: {args.input}")
 
-    result, payload = process_frame(frame)
+    if args.test_model:
+        result = test_model(frame)
+        payload = None
+    else:
+        result, payload = process_frame(frame, debug_dir=args.debug_dir)
 
     # Save visualization
     cv2.imwrite(args.output, result)

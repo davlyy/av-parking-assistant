@@ -1,8 +1,7 @@
- numpy>=2.0.0
+numpy>=2.0.0
 opencv-python>=4.9.0
+inference-sdk
+python-dotenv
 pygame
 networkx
 # carla — install from CARLA simulator package (not on PyPI): pip install <carla_path>/PythonAPI/carla/dist/carla-<version>.tar.gz
-
-numpy
-ultralytics
