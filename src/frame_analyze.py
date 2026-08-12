@@ -13,6 +13,9 @@ load_dotenv()
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = "parking-lot-npjkj/2"
+YOLO_MODEL_PATH = "model.pt"
+_yolo_model = None
+_yolo_model_path = None
 
 # Vehicle spec (Lincoln MKZ 2017) — ground truth for calibration
 VEHICLE_SPEC = {
@@ -98,7 +101,7 @@ def estimate_yaw(pred):
 def dist(a, b):
     return np.hypot(a['x'] - b['x'], a['y'] - b['y'])
 
-#[Stage 0] White Paper Detection and Crop
+#[Stage 0] Parking-Lot Detection and Crop
 def _order_quad_points(points):
     """Order quadrilateral vertices as top-left, top-right, bottom-right, bottom-left."""
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
@@ -112,35 +115,34 @@ def _order_quad_points(points):
     return ordered
 
 
-def find_white_sheet_corners(frame):
-    """Find the four corners of the white paper sheet using relaxed HSV bounds."""
+def find_parking_lot_corners(frame):
+    """Find the four corners of the largest dark parking-lot surface."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # Paper remains bright with low saturation even under uneven lighting.
-    # The upper saturation bound is deliberately relaxed for warm shadows.
-    paper_mask = cv2.inRange(hsv, (0, 0, 120), (180, 130, 255))
+    parking_lot_mask = cv2.inRange(hsv, (0, 0, 0), (180, 105, 145))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-    paper_mask = cv2.morphologyEx(paper_mask, cv2.MORPH_CLOSE, kernel)
-    paper_mask = cv2.morphologyEx(paper_mask, cv2.MORPH_OPEN, kernel)
+    # Join the dark surface across white bay markings and parked cars.
+    parking_lot_mask = cv2.morphologyEx(parking_lot_mask, cv2.MORPH_CLOSE, kernel)
+    parking_lot_mask = cv2.morphologyEx(parking_lot_mask, cv2.MORPH_OPEN, kernel)
 
-    contours, _ = cv2.findContours(paper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(parking_lot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        raise ValueError("Could not locate the white paper sheet in the frame")
+        raise ValueError("Could not locate the dark parking lot in the frame")
 
-    paper_contour = max(contours, key=cv2.contourArea)
+    parking_lot_contour = max(contours, key=cv2.contourArea)
     min_area = frame.shape[0] * frame.shape[1] * 0.12
-    if cv2.contourArea(paper_contour) < min_area:
-        raise ValueError("Detected paper sheet is too small; ensure the complete sheet is visible")
-    return _order_quad_points(cv2.boxPoints(cv2.minAreaRect(paper_contour)))
+    if cv2.contourArea(parking_lot_contour) < min_area:
+        raise ValueError("Detected parking lot is too small; ensure the complete lot is visible")
+    return _order_quad_points(cv2.boxPoints(cv2.minAreaRect(parking_lot_contour)))
 
 
 def detect_and_crop_parking_mat(frame):
-    """Crop to the detected white paper sheet without perspective warping.
+    """Crop to the detected parking-lot rectangle without perspective warping.
 
-    The returned image is an axis-aligned crop of the paper-sheet bounds. The
-    quadrilateral is detected for future perspective correction, but no
+    The returned image is an axis-aligned crop of the four parking-lot-corner
+    bounds. The quadrilateral is detected, but no
     ``getPerspectiveTransform`` or ``warpPerspective`` is applied here.
     """
-    corners = find_white_sheet_corners(frame)
+    corners = find_parking_lot_corners(frame)
     x1, y1 = np.floor(corners.min(axis=0)).astype(int)
     x2, y2 = np.ceil(corners.max(axis=0)).astype(int)
     x1, y1 = max(0, x1), max(0, y1)
@@ -154,6 +156,27 @@ def preprocess(img):
     gray_eq = clahe.apply(gray)
     denoised = cv2.bilateralFilter(gray_eq, d=24, sigmaColor=40, sigmaSpace=100)
     return denoised, cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+
+def reduce_specular_highlights(frame, value_cap=220, saturation_limit=100):
+    """Cap bright, low-saturation glare while preserving normal car colours.
+
+    Glossy reflections are usually close to white: high V and low S in HSV.
+    Only those pixels are capped, avoiding a global brightness reduction that
+    would weaken the white parking lines and red car body.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    glare = (value > value_cap) & (saturation < saturation_limit)
+    value[glare] = value_cap
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
+def prepare_model_input(frame):
+    """Suppress glare and apply 9x9 colour-preserving Gaussian smoothing."""
+    glare_reduced = reduce_specular_highlights(frame)
+    return cv2.GaussianBlur(glare_reduced, (9, 9), 0)
 
 #Stage 2: Lane Marking Detection
 def detect_slot_lines(gray, bev_img):
@@ -395,6 +418,75 @@ def detect_vehicles(frame):
     print(f"[Debug] Cars: {len(cars)}, Available slots: {len(avail)}")
     return cars, avail, predictions
 
+
+def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.1):
+    """Detect ``cars`` and ``free``/``avail`` slots using a local YOLO model.
+
+    Returns the same ``cars, avail, raw_predictions`` structure as
+    ``detect_vehicles`` so downstream ego, occupancy, and payload logic is
+    unchanged. YOLO class labels ``car``/``cars`` map to cars and
+    ``free``/``avail`` map to available slots.
+    """
+    global _yolo_model, _yolo_model_path
+
+    model_path = str(Path(model_path))
+    if not Path(model_path).is_file():
+        raise FileNotFoundError(f"YOLO model not found: {model_path}")
+
+    if _yolo_model is None or _yolo_model_path != model_path:
+        try:
+            from ultralytics import YOLO
+        except ImportError as error:
+            raise RuntimeError(
+                "YOLO detection requires ultralytics. Run: pip install ultralytics"
+            ) from error
+        _yolo_model = YOLO(model_path)
+        _yolo_model_path = model_path
+
+    result = _yolo_model.predict(frame, conf=confidence, verbose=False)[0]
+    names = result.names
+    cars, avail, predictions = [], [], []
+    for box in result.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+        class_id = int(box.cls[0].item())
+        class_name = str(names[class_id])
+        conf = float(box.conf[0].item())
+        width, height = x2 - x1, y2 - y1
+        prediction = {
+            "x": (x1 + x2) / 2,
+            "y": (y1 + y2) / 2,
+            "width": width,
+            "height": height,
+            "confidence": conf,
+            "class": class_name,
+            "class_id": class_id,
+        }
+        predictions.append(prediction)
+        entry = {
+            "x": prediction["x"], "y": prediction["y"],
+            "width": width, "height": height,
+            "conf": conf, "class": class_name,
+            "center_px": (prediction["x"], prediction["y"]),
+            "size_px": (width, height),
+            "bbox_px": (int(x1), int(y1), int(x2), int(y2)),
+        }
+        label = class_name.lower()
+        if label in {"car", "cars"}:
+            cars.append(entry)
+        elif label in {"free", "avail"}:
+            avail.append(entry)
+
+    print(f"[Debug] YOLO raw predictions: {len(predictions)}")
+    print(f"[Debug] YOLO Cars: {len(cars)}, Available slots: {len(avail)}")
+    return cars, avail, predictions
+
+
+def run_vehicle_detector(frame, detector, yolo_model_path, confidence):
+    """Run the selected perception backend using a common output format."""
+    if detector == "yolo":
+        return detect_vehicles_yolo(frame, yolo_model_path, confidence)
+    return detect_vehicles(frame)
+
 #[Stage 4]: Identify Ego Vehicle
 def identify_ego(cars, frame):
     """
@@ -443,6 +535,25 @@ def remove_slots_containing_ego(avail, ego):
     if occupied_slots:
         print(f"[Debug] Removed {occupied_slots} free-slot prediction(s) containing the ego car")
     return free_slots
+
+
+def filter_slots_by_median_area(avail, tolerance=0.30):
+    """Reject anomalously sized free-slot boxes when enough slots are present."""
+    if len(avail) <= 3:
+        return avail
+
+    areas = np.array([slot['width'] * slot['height'] for slot in avail])
+    median_area = float(np.median(areas))
+    min_area = median_area * (1.0 - tolerance)
+    max_area = median_area * (1.0 + tolerance)
+    filtered = [
+        slot for slot, area in zip(avail, areas)
+        if min_area <= area <= max_area
+    ]
+    removed = len(avail) - len(filtered)
+    if removed:
+        print(f"[Debug] Removed {removed} free-slot prediction(s) outside ±{tolerance:.0%} of median area")
+    return filtered
 
 #[Stage 5]: Build A* JSON Payload
 def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None, image_height=None):
@@ -639,46 +750,31 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
     return vis
 
 
-def process_frame(frame, debug_dir=None, frame_id=0):
+def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
+                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.1):
     global PIXELS_PER_METER
-
-    if debug_dir:
-        Path(debug_dir).mkdir(parents=True, exist_ok=True)
-
-    # Stage 0: Detect the white paper sheet and crop it without warping.
+    # Stage 0: Detect the four parking-lot corners and crop their bounds only.
     frame = detect_and_crop_parking_mat(frame)
-    if debug_dir:
-        _save_debug_image(debug_dir, "stage_0_paper_crop.png", frame)
 
-    # Stage 1: Preprocess
-    gray, hsv = preprocess(frame)
-    if debug_dir:
-        _save_debug_image(debug_dir, "stage_1_gray.png", gray)
-        _save_debug_image(debug_dir, "stage_1_hsv.png", cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+    # Stage 1 is not used after removing line detection. Skipping its bilateral
+    # filter avoids processing the full-resolution image unnecessarily.
 
-    # Stage 2: Lane line detection → slot geometry
-    lines = detect_slot_lines(gray, frame)
-    merged_h, merged_v, slots, rejected_slots, corners = \
-        cluster_lines_to_slots(lines)
-    if debug_dir:
-        _save_debug_image(debug_dir, "stage_2_line_slots.png",
-                          _draw_line_detection(frame, lines, merged_h, merged_v,
-                                               slots, rejected_slots, corners))
+    # Stage 2 removed: parking availability comes directly from the detector.
+    lines = None
+    merged_h, merged_v, slots, rejected_slots, corners = [], [], [], [], []
 
     # Stage 3: Roboflow detection → cars + available slots
-    cars, avail, raw_preds = detect_vehicles(frame)
-    if debug_dir:
-        _save_debug_image(debug_dir, "stage_3_roboflow.png",
-                          _draw_raw_predictions(frame, raw_preds))
+    model_frame = prepare_model_input(frame)
+    cars, avail, raw_preds = run_vehicle_detector(
+        model_frame, detector, yolo_model_path, confidence
+    )
 
     # Stage 4: Identify ego vs obstacles
-    ego, obstacles = identify_ego(cars, frame)
+    ego, obstacles = identify_ego(cars, model_frame)
+    avail = filter_slots_by_median_area(avail)
     avail = remove_slots_containing_ego(avail, ego)
     print(f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
           f"Obstacles: {len(obstacles)} | Available: {len(avail)}")
-    if debug_dir:
-        _save_debug_image(debug_dir, "stage_4_ego.png",
-                          _draw_ego_selection(frame, cars, ego, obstacles))
 
     # Stage 4b: Calibrate px/m from ego vehicle bbox
     if ego is not None:
@@ -696,18 +792,19 @@ def process_frame(frame, debug_dir=None, frame_id=0):
         image_height=frame.shape[0],
     )
 
-    # Visualization
+    # Visualization.  ``process_video`` writes this image to the annotated
+    # output video, so it must always be a valid frame rather than ``None``.
     result = draw_detections(
         frame, lines, slots, rejected_slots, corners,
         cars, avail, ego, obstacles, merged_h, merged_v
     )
     if debug_dir:
         _save_debug_image(debug_dir, "stage_5_final.png", result)
-
     return result, payload
 
 
-def test_model(frame):
+def test_model(frame, detector="roboflow", yolo_model_path=YOLO_MODEL_PATH,
+               confidence=0.2):
     """Run only Stages 3, 4, and 4b on an input image.
 
     This is intended for validating the Roboflow model labels and ego-car
@@ -715,11 +812,14 @@ def test_model(frame):
     """
     global PIXELS_PER_METER
 
-    # Stage 3: Roboflow detection → cars + available slots
-    cars, avail, raw_preds = detect_vehicles(frame)
+    # Stage 3: suppress glare, then detect cars + available slots
+    model_frame = prepare_model_input(frame)
+    cars, avail, raw_preds = run_vehicle_detector(
+        model_frame, detector, yolo_model_path, confidence
+    )
 
     # Stage 4: Identify red ego vehicle
-    ego, obstacles = identify_ego(cars, frame)
+    ego, obstacles = identify_ego(cars, model_frame)
     print(f"[Test model] Ego: {ego['class'] if ego else 'None'} | "
           f"Obstacles: {len(obstacles)} | Available: {len(avail)}")
 
@@ -737,7 +837,9 @@ def test_model(frame):
     return result
 
 
-def process_video(input_path, output_path, sample_fps, payload_path):
+def process_video(input_path, output_path, sample_fps, payload_path,
+                  detector="roboflow", yolo_model_path=YOLO_MODEL_PATH,
+                  confidence=0.2):
     """Process a video at ``sample_fps`` and write annotated video + payloads."""
     capture = cv2.VideoCapture(input_path)
     if not capture.isOpened():
@@ -766,7 +868,11 @@ def process_video(input_path, output_path, sample_fps, payload_path):
                 frame_id += 1
                 continue
 
-            result, payload = process_frame(frame, debug_dir=None, frame_id=frame_id)
+            result, payload = process_frame(
+                frame, debug_dir=None, frame_id=frame_id,
+                detector=detector, yolo_model_path=yolo_model_path,
+                confidence=confidence,
+            )
             if writer is None:
                 height, width = result.shape[:2]
                 output_size = (width, height)
@@ -807,15 +913,19 @@ if __name__ == "__main__":
                         help="Directory for images saved after every pipeline stage")
     parser.add_argument("--test-model", action="store_true",
                         help="Run only Roboflow detection, ego selection, and calibration")
-    parser.add_argument("--confidence", type=float, default=0.1,
-                        help="Roboflow confidence threshold from 0.0 to 1.0; lower returns more candidate boxes")
-    parser.add_argument("--fps", type=float, default=1.0,
+    parser.add_argument("--confidence", type=float, default=0.2,
+                        help="Detection confidence threshold from 0.0 to 1.0; lower returns more candidate boxes")
+    parser.add_argument("--detector", choices=["roboflow", "yolo"], default="yolo",
+                        help="Perception backend")
+    parser.add_argument("--yolo-model", type=str, default=YOLO_MODEL_PATH,
+                        help="Path to local YOLO weights used with --detector yolo")
+    parser.add_argument("--fps", type=float, default=3.0,
                         help="Video processing rate in sampled frames per second")
     args = parser.parse_args()
 
-    if args.confidence is not None:
-        if not 0.0 <= args.confidence <= 1.0:
-            parser.error("--confidence must be between 0.0 and 1.0")
+    if not 0.0 <= args.confidence <= 1.0:
+        parser.error("--confidence must be between 0.0 and 1.0")
+    if args.detector == "roboflow":
         roboflow_client.configure(
             InferenceConfiguration(confidence_threshold=args.confidence)
         )
@@ -826,7 +936,11 @@ if __name__ == "__main__":
     if is_video:
         if args.test_model:
             parser.error("--test-model currently accepts images only")
-        process_video(args.input, args.output, args.fps, args.payload)
+        process_video(
+            args.input, args.output, args.fps, args.payload,
+            detector=args.detector, yolo_model_path=args.yolo_model,
+            confidence=args.confidence,
+        )
         raise SystemExit(0)
 
     frame = cv2.imread(args.input)
@@ -834,14 +948,21 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Cannot read image: {args.input}")
 
     if args.test_model:
-        result = test_model(frame)
+        result = test_model(
+            frame, detector=args.detector, yolo_model_path=args.yolo_model,
+            confidence=args.confidence,
+        )
         payload = None
     else:
-        result, payload = process_frame(frame, debug_dir=args.debug_dir)
+        result, payload = process_frame(
+            frame, debug_dir=args.debug_dir, detector=args.detector,
+            yolo_model_path=args.yolo_model, confidence=args.confidence,
+        )
 
     # Save visualization
-    cv2.imwrite(args.output, result)
-    print(f"\nDetection result saved to: {args.output}")
+    if result:
+        cv2.imwrite(args.output, result)
+        print(f"\nDetection result saved to: {args.output}")
 
     # Save payload
     if payload:

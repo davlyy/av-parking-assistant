@@ -68,7 +68,7 @@ ROBOFLOW_API_KEY=<your-key> python src/frame_analyze.py \
 
 Set `--mat-width-m` and `--mat-height-m` to the dimensions represented by the
 printed mat. The payload's coordinate origin is the top-left of the cropped
-paper-sheet image, with x growing right and y growing down.
+parking-lot image, with x growing right and y growing down.
 
 ### Process a video
 
@@ -83,6 +83,20 @@ python src/frame_analyze.py \
   --output parking_run_annotated.mp4 \
   --payload parking_run_payloads.json \
   --fps 2
+```
+
+### Use local YOLO weights
+
+The Roboflow detector remains the default. To use local weights with class
+names `car` and `free`, select the YOLO backend:
+
+```bash
+python src/frame_analyze.py \
+  --input example_frame/toy_1.jpg \
+  --output yolo_result.png \
+  --detector yolo \
+  --yolo-model model.pt \
+  --confidence 0.1
 ```
 
 **CARLA (manual driving):**
