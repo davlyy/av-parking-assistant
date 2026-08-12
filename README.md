@@ -50,6 +50,60 @@ pip install -r requirements.txt
 python src/main.py --source camera --config config/config.json
 ```
 
+### Process a toy parking-mat frame
+
+`frame_analyze.py` is an offline pipeline for the photographs in
+`example_frame/`. Stage 0 uses the four `DICT_4X4_50` ArUco markers with IDs
+0--3 at the parking-mat corners to add the four image-pixel coordinates to the
+payload as `parking_mat_bounds`. Stage 1 also uses those markers to add an
+image-pixel-to-mat-metre homography as `input_calibration`. The original camera
+frame is not cropped or rectified. If all four markers are not visible, it
+falls back to detecting the dark printed mat, but omits the marker calibration.
+The model must use `car` and `free` class labels. A predicted `free` box is
+accepted only when it overlaps a slot derived from the white T-shaped divider
+markings.
+
+```bash
+ROBOFLOW_API_KEY=<your-key> python src/frame_analyze.py \
+  --input example_frame/toy_1.jpg \
+  --output result.png \
+  --payload payload.json \
+  --mat-width-m 12 --mat-height-m 18
+```
+
+Set `--mat-width-m` and `--mat-height-m` to the dimensions represented by the
+printed mat. The payload's coordinate origin is the top-left of the cropped
+parking-lot image, with x growing right and y growing down.
+
+### Process a video
+
+Pass a video file as `--input`. `--fps` controls how many source frames are
+processed each second. The output is an annotated MP4 and the payload file is
+a JSON object with one payload per sampled frame that has an ego car and free
+parking slot.
+
+```bash
+python src/frame_analyze.py \
+  --input parking_run.mp4 \
+  --output parking_run_annotated.mp4 \
+  --payload parking_run_payloads.json \
+  --fps 2
+```
+
+### Use local YOLO weights
+
+The Roboflow detector remains the default. To use local weights with class
+names `car` and `free`, select the YOLO backend:
+
+```bash
+python src/frame_analyze.py \
+  --input example_frame/toy_1.jpg \
+  --output yolo_result.png \
+  --detector yolo \
+  --yolo-model model.pt \
+  --confidence 0.1
+```
+
 **CARLA (manual driving):**
 ```json
 # config/config.json → set "source_type": "carla", "manual": true

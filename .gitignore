@@ -5,4 +5,5 @@ __pycache__/
 *.onnx
 data/raw/
 .env
+debug_frames/
 .idea
