@@ -53,10 +53,15 @@ python src/main.py --source camera --config config/config.json
 ### Process a toy parking-mat frame
 
 `frame_analyze.py` is an offline pipeline for the photographs in
-`example_frame/`. It finds the dark printed mat, rectifies it to a bird's-eye
-view, then sends that image to Roboflow. The model must use `car` and `free`
-class labels. A predicted `free` box is accepted only when it overlaps a slot
-derived from the white T-shaped divider markings.
+`example_frame/`. Stage 0 uses the four `DICT_4X4_50` ArUco markers with IDs
+0--3 at the parking-mat corners to add the four image-pixel coordinates to the
+payload as `parking_mat_bounds`. Stage 1 also uses those markers to add an
+image-pixel-to-mat-metre homography as `input_calibration`. The original camera
+frame is not cropped or rectified. If all four markers are not visible, it
+falls back to detecting the dark printed mat, but omits the marker calibration.
+The model must use `car` and `free` class labels. A predicted `free` box is
+accepted only when it overlaps a slot derived from the white T-shaped divider
+markings.
 
 ```bash
 ROBOFLOW_API_KEY=<your-key> python src/frame_analyze.py \

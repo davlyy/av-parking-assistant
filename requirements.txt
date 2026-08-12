@@ -1,5 +1,5 @@
 numpy>=2.0.0
-opencv-python>=4.9.0
+opencv-contrib-python>=4.9.0
 inference-sdk
 python-dotenv
 ultralytics

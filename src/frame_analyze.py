@@ -13,7 +13,7 @@ load_dotenv()
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = "parking-lot-npjkj/2"
-YOLO_MODEL_PATH = "model.pt"
+YOLO_MODEL_PATH = "besttoy.pt"
 _yolo_model = None
 _yolo_model_path = None
 
@@ -101,7 +101,14 @@ def estimate_yaw(pred):
 def dist(a, b):
     return np.hypot(a['x'] - b['x'], a['y'] - b['y'])
 
-#[Stage 0] Parking-Lot Detection and Crop
+#[Stage 0] ArUco Parking-Mat Bounds Detection
+ARUCO_DICTIONARY = "DICT_4X4_50"
+ARUCO_CORNER_IDS = {0, 1, 2, 3}
+# The printed parking mat is A3 landscape (420 x 297 mm).
+PARKING_MAT_WIDTH_M = 0.420
+PARKING_MAT_HEIGHT_M = 0.297
+
+
 def _order_quad_points(points):
     """Order quadrilateral vertices as top-left, top-right, bottom-right, bottom-left."""
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
@@ -113,6 +120,47 @@ def _order_quad_points(points):
     ordered[1] = points[np.argmin(diffs)]
     ordered[3] = points[np.argmax(diffs)]
     return ordered
+
+
+def find_aruco_mat_corners(frame):
+    """Return the four parking-mat bounds defined by ArUco markers 0--3.
+
+    Each marker sits just outside one mat corner.  The marker vertex closest
+    to the centre of all four markers is the vertex facing into the mat, so
+    those four vertices form a stable quadrilateral for rectification.
+    """
+    if not hasattr(cv2, "aruco"):
+        return None
+
+    dictionary_id = getattr(cv2.aruco, ARUCO_DICTIONARY)
+    dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+    parameters = cv2.aruco.DetectorParameters()
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        marker_corners, marker_ids, _ = cv2.aruco.ArucoDetector(
+            dictionary, parameters
+        ).detectMarkers(frame)
+    else:
+        marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(
+            frame, dictionary, parameters=parameters)
+
+    if marker_ids is None:
+        return None
+
+    detected = {
+        int(marker_id): corners.reshape(4, 2)
+        for corners, marker_id in zip(marker_corners, marker_ids.ravel())
+        if int(marker_id) in ARUCO_CORNER_IDS
+    }
+    if detected.keys() != ARUCO_CORNER_IDS:
+        return None
+
+    marker_centres = np.array([corners.mean(axis=0) for corners in detected.values()])
+    mat_centre = marker_centres.mean(axis=0)
+    inner_corners = [
+        corners[np.argmin(np.linalg.norm(corners - mat_centre, axis=1))]
+        for corners in detected.values()
+    ]
+    return _order_quad_points(inner_corners)
 
 
 def find_parking_lot_corners(frame):
@@ -135,21 +183,60 @@ def find_parking_lot_corners(frame):
     return _order_quad_points(cv2.boxPoints(cv2.minAreaRect(parking_lot_contour)))
 
 
-def detect_and_crop_parking_mat(frame):
-    """Crop to the detected parking-lot rectangle without perspective warping.
+def find_parking_mat_bounds(frame):
+    """Return parking-mat corners in the original image pixel coordinates.
 
-    The returned image is an axis-aligned crop of the four parking-lot-corner
-    bounds. The quadrilateral is detected, but no
-    ``getPerspectiveTransform`` or ``warpPerspective`` is applied here.
+    Stage 0 deliberately does not crop or rectify the frame.  It records the
+    marker-defined quadrilateral in the payload while all detection and
+    visualization continue to use the unmodified camera image.
     """
-    corners = find_parking_lot_corners(frame)
-    x1, y1 = np.floor(corners.min(axis=0)).astype(int)
-    x2, y2 = np.ceil(corners.max(axis=0)).astype(int)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-    return frame[y1:y2, x1:x2].copy()
+    corners = find_aruco_mat_corners(frame)
+    if corners is not None:
+        print("[Stage 0] Found parking-mat bounds from four ArUco markers")
+        return corners
 
-#[Stage 1] Preprocessing
+    print("[Stage 0] ArUco bounds unavailable; using dark-surface bounds")
+    try:
+        return find_parking_lot_corners(frame)
+    except ValueError as error:
+        print(f"[Stage 0] Parking-mat bounds unavailable: {error}")
+        return None
+
+
+#[Stage 1] Input Calibration from ArUco Markers
+def calibrate_input_from_aruco(frame):
+    """Calculate image-to-mat calibration without modifying the input frame.
+
+    Returns homographies between original image pixels and metres on the
+    printed A3 parking mat.  ``None`` means the four marker bounds were not
+    available for this frame.
+    """
+    parking_mat_corners = find_aruco_mat_corners(frame)
+    if parking_mat_corners is None:
+        return None
+
+    image_corners = np.asarray(parking_mat_corners, dtype=np.float32)
+    mat_corners_m = np.array([
+        [0.0, 0.0],
+        [PARKING_MAT_WIDTH_M, 0.0],
+        [PARKING_MAT_WIDTH_M, PARKING_MAT_HEIGHT_M],
+        [0.0, PARKING_MAT_HEIGHT_M],
+    ], dtype=np.float32)
+    image_to_mat = cv2.getPerspectiveTransform(image_corners, mat_corners_m)
+    mat_to_image = cv2.getPerspectiveTransform(mat_corners_m, image_corners)
+    print("[Stage 1] Calibrated original image coordinates from ArUco mat bounds")
+    return {
+        "type": "homography",
+        "image_coordinate_space": "pixels",
+        "mat_coordinate_space": "metres",
+        "mat_width_m": PARKING_MAT_WIDTH_M,
+        "mat_height_m": PARKING_MAT_HEIGHT_M,
+        "H_image_to_mat": image_to_mat,
+        "H_mat_to_image": mat_to_image,
+    }
+
+
+#[Stage 2] Preprocessing
 def preprocess(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(8, 8))
@@ -419,7 +506,7 @@ def detect_vehicles(frame):
     return cars, avail, predictions
 
 
-def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.1):
+def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
     """Detect ``cars`` and ``free``/``avail`` slots using a local YOLO model.
 
     Returns the same ``cars, avail, raw_predictions`` structure as
@@ -556,7 +643,9 @@ def filter_slots_by_median_area(avail, tolerance=0.30):
     return filtered
 
 #[Stage 5]: Build A* JSON Payload
-def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None, image_height=None):
+def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None,
+                        image_height=None, parking_mat_corners=None,
+                        input_calibration=None):
     """
     Converts pixel-space detections to metric A* payload.
     Target slot = available slot closest to ego vehicle.
@@ -599,6 +688,22 @@ def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None, ima
         "frame_id": frame_id,
         "image_width": image_width,
         "image_height": image_height,
+        "parking_mat_bounds": {
+            "coordinate_space": "image_pixels",
+            "corners": [
+                {"name": name, "x": round(float(point[0]), 2), "y": round(float(point[1]), 2)}
+                for name, point in zip(
+                    ("top_left", "top_right", "bottom_right", "bottom_left"),
+                    parking_mat_corners,
+                )
+            ],
+        } if parking_mat_corners is not None else None,
+        "input_calibration": {
+            **{key: value for key, value in input_calibration.items()
+               if key not in {"H_image_to_mat", "H_mat_to_image"}},
+            "H_image_to_mat": np.asarray(input_calibration["H_image_to_mat"]).round(9).tolist(),
+            "H_mat_to_image": np.asarray(input_calibration["H_mat_to_image"]).round(6).tolist(),
+        } if input_calibration is not None else None,
         "projection": {
             "type": "homography",
             "H_world_to_image": world_to_image,
@@ -641,26 +746,8 @@ def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None, ima
     return payload
 
 #Visualization
-def draw_detections(img, lines, slots, rejected_slots, corners,
-                    cars, avail, ego, obstacles, merged_h=None, merged_v=None):
+def draw_detections(img, cars, avail, ego, obstacles):
     vis = img.copy()
-
-    # Corners (magenta)
-    for i, (cx, cy) in enumerate(corners):
-        cv2.circle(vis, (int(cx), int(cy)), 5, (255, 0, 255), -1)
-        cv2.putText(vis, f"P{i}", (int(cx)+5, int(cy)+15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1)
-
-    # Valid slots (unique colors)
-    if slots:
-        rng    = np.random.default_rng(42)
-        colors = rng.integers(50, 255, size=(len(slots), 3)).tolist()
-        for i, (tl, br) in enumerate(slots):
-            color = tuple(colors[i])
-            cv2.rectangle(vis, (int(tl[0]), int(tl[1])),
-                               (int(br[0]), int(br[1])), color, 2)
-            cv2.putText(vis, f"S{i+1}", (int(tl[0]), max(15, int(tl[1])-5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
     # Available slots from Roboflow (green)
     for s in avail:
@@ -751,26 +838,20 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
 
 
 def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
-                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.1):
+                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.5):
     global PIXELS_PER_METER
-    # Stage 0: Detect the four parking-lot corners and crop their bounds only.
-    frame = detect_and_crop_parking_mat(frame)
-
-    # Stage 1 is not used after removing line detection. Skipping its bilateral
-    # filter avoids processing the full-resolution image unnecessarily.
-
-    # Stage 2 removed: parking availability comes directly from the detector.
-    lines = None
-    merged_h, merged_v, slots, rejected_slots, corners = [], [], [], [], []
+    # Stage 0: record the mat's four corners; retain the original camera frame.
+    parking_mat_corners = find_parking_mat_bounds(frame)
+    input_calibration = calibrate_input_from_aruco(frame)
 
     # Stage 3: Roboflow detection → cars + available slots
-    model_frame = prepare_model_input(frame)
+    # model_frame = prepare_model_input(frame)
     cars, avail, raw_preds = run_vehicle_detector(
-        model_frame, detector, yolo_model_path, confidence
+        frame, detector, yolo_model_path, confidence
     )
 
     # Stage 4: Identify ego vs obstacles
-    ego, obstacles = identify_ego(cars, model_frame)
+    ego, obstacles = identify_ego(cars, frame)
     avail = filter_slots_by_median_area(avail)
     avail = remove_slots_containing_ego(avail, ego)
     print(f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
@@ -790,14 +871,13 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
         frame_id=frame_id,
         image_width=frame.shape[1],
         image_height=frame.shape[0],
+        parking_mat_corners=parking_mat_corners,
+        input_calibration=input_calibration,
     )
 
     # Visualization.  ``process_video`` writes this image to the annotated
     # output video, so it must always be a valid frame rather than ``None``.
-    result = draw_detections(
-        frame, lines, slots, rejected_slots, corners,
-        cars, avail, ego, obstacles, merged_h, merged_v
-    )
+    result = draw_detections(frame, cars, avail, ego, obstacles)
     if debug_dir:
         _save_debug_image(debug_dir, "stage_5_final.png", result)
     return result, payload
@@ -831,9 +911,7 @@ def test_model(frame, detector="roboflow", yolo_model_path=YOLO_MODEL_PATH,
         PIXELS_PER_METER = None
 
     # No Stage 5 payload is created in model-test mode.
-    result = draw_detections(
-        frame, None, [], [], [], cars, avail, ego, obstacles
-    )
+    result = draw_detections(frame, cars, avail, ego, obstacles)
     return result
 
 
@@ -919,7 +997,7 @@ if __name__ == "__main__":
                         help="Perception backend")
     parser.add_argument("--yolo-model", type=str, default=YOLO_MODEL_PATH,
                         help="Path to local YOLO weights used with --detector yolo")
-    parser.add_argument("--fps", type=float, default=3.0,
+    parser.add_argument("--fps", type=float, default=10.0,
                         help="Video processing rate in sampled frames per second")
     args = parser.parse_args()
 
@@ -960,7 +1038,7 @@ if __name__ == "__main__":
         )
 
     # Save visualization
-    if result:
+    if result is not None:
         cv2.imwrite(args.output, result)
         print(f"\nDetection result saved to: {args.output}")
 
