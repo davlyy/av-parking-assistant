@@ -3,6 +3,7 @@ from input.config import (
     CameraSetup,
     CarlaConfig,
     ImageConfig,
+    VideoConfig,
     SourceConfig,
     Vector3D,
     Rotation3D,
@@ -11,6 +12,7 @@ from input.config import (
 from input.source_iface import InputSource, Frame
 from input.camera_source import CameraSource
 from input.image_source import ImageSource
+from input.video_source import VideoSource
 
 try:
     from input.carla_source import CarlaSource
@@ -22,6 +24,7 @@ __all__ = [
     "CameraSetup",
     "CarlaConfig",
     "ImageConfig",
+    "VideoConfig",
     "SourceConfig",
     "Vector3D",
     "Rotation3D",
@@ -30,4 +33,5 @@ __all__ = [
     "CameraSource",
     "ImageSource",
     "CarlaSource",
+    "VideoSource",
 ]

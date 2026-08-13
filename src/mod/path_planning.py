@@ -3,6 +3,7 @@ from ifaces.algorithms_iface import PathPlanning
 import numpy as np
 import heapq
 import itertools
+import cv2
 
 vehicle: Vehicle = Vehicle()
 gridmap: GridMap3D = GridMap3D()
@@ -65,36 +66,30 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
     start.h_cost = heuristic_cost(start, end)
 
     open_nodes[start.idx] = start
-    heapq.heappush(heap, (priority(start), next(counter), start.idx))
+    heapq.heappush(heap, (priority(start), next(counter), start))
 
     iterations = 0
     best_dist_seen = float("inf")
 
     while heap:
+        _, _, current = heapq.heappop(heap)
+
+        if open_nodes.get(current.idx) is not current:
+            continue
+
+        del open_nodes[current.idx]
+
+        if current.idx in closed:
+            continue
+
         iterations += 1
 
         if iterations > config.max_iterations:
-            print("Stopped after iteration limit")
-            print("iterations:", iterations)
-            print("closed:", len(closed))
-            print("open:", len(open_nodes))
-            print("best_dist_seen:", best_dist_seen)
             return None
 
-        _, _, current_idx = heapq.heappop(heap)
+        closed.add(current.idx)
 
-        # Wurde dieser Eintrag inzwischen durch einen besseren ersetzt?
-        if current_idx not in open_nodes:
-            continue
-
-        current = open_nodes.pop(current_idx)
-
-        if current_idx in closed:
-            continue
-
-        closed.add(current_idx)
-
-        dist_to_goal = heuristic_cost(current, end)
+        dist_to_goal = position_distance(current, end)
         best_dist_seen = min(best_dist_seen, dist_to_goal)
 
         if iterations % 10000 == 0:
@@ -129,7 +124,7 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
 
             if old is None or node.g_cost < old.g_cost:
                 open_nodes[node.idx] = node
-                heapq.heappush(heap, (priority(node), next(counter), node.idx))
+                heapq.heappush(heap, (priority(node), next(counter), node))
 
     print("iterations:", iterations)
     print("closed:", len(closed))
@@ -329,22 +324,19 @@ def is_inside_search_corridor(node: Node, start: Node, end: Node, margin: float 
 
     return min_x <= node.x <= max_x and min_y <= node.y <= max_y
 
+def position_distance(node: Node, end: Node) -> float:
+    return math.hypot(end.x - node.x, end.y - node.y)
+
 def heuristic_cost(node: Node, end: Node) -> float:
-    return np.hypot(end.x - node.x, end.y - node.y)
+    return position_distance(node, end) + 1.5 * yaw_distance(node.theta, end.theta)
 
 def yaw_distance(a: float, b: float) -> float:
     return abs(normalize_angle(a - b))
 
 
 def is_goal_reached(node: Node, end: Node) -> bool:
-    position_tolerance = float(
-        getattr(config, "planner_goal_tolerance", config.goal_tolerance)
-    )
-
-    position_ok = heuristic_cost(node, end) < position_tolerance
-    yaw_ok = yaw_distance(node.theta, end.theta) < config.goal_yaw_tolerance
-
-    return position_ok and yaw_ok
+    position_tolerance = float(getattr(config, "planner_goal_tolerance", config.goal_tolerance))
+    return position_distance(node, end) < position_tolerance and yaw_distance(node.theta, end.theta) < config.goal_yaw_tolerance
 
 def world_to_grid(x: float, y: float, gridmap: GridMap3D) -> tuple[int, int]:
     x_idx = int(round((x - gridmap.origin_x) / gridmap.resolution))
@@ -450,33 +442,23 @@ def extend_bounds_with_drivable_area(payload: dict, xs: list[float], ys: list[fl
 
 def apply_drivable_area_mask(payload: dict, gridmap: GridMap3D) -> None:
     area = payload.get("drivable_area")
-
     if not area:
         return
 
-    if area.get("type") != "image_polygon":
-        raise ValueError("Unsupported drivable_area type")
-
     polygon = area.get("points", [])
-
     if len(polygon) < 3:
-        raise ValueError("drivable_area.points must contain at least 3 points")
+        return
 
-    height_cells, width_cells = gridmap.occupancy.shape
+    grid_points = []
 
-    for y_idx in range(height_cells):
-        for x_idx in range(width_cells):
-            wx = gridmap.origin_x + x_idx * gridmap.resolution
-            wy = gridmap.origin_y + y_idx * gridmap.resolution
+    for u, v in polygon:
+        x, y = project_payload_image_to_world(payload, u, v)
+        x_idx, y_idx = world_to_grid(x, y, gridmap)
+        grid_points.append([x_idx, y_idx])
 
-            u, v = project_world_to_payload_image(payload, wx, wy)
-
-            if not np.isfinite(u) or not np.isfinite(v):
-                gridmap.occupancy[y_idx, x_idx] = 1
-                continue
-
-            if not point_in_polygon(u, v, polygon):
-                gridmap.occupancy[y_idx, x_idx] = 1
+    mask = np.zeros_like(gridmap.occupancy, dtype=np.uint8)
+    cv2.fillPoly(mask, [np.array(grid_points, dtype=np.int32)], 1)
+    gridmap.occupancy[mask == 0] = 1
 
 def gridmap_init(payload: dict):
     global gridmap
@@ -535,33 +517,25 @@ def gridmap_init(payload: dict):
         half_l = float(obs["length"]) / 2.0 + obstacle_inflation
         half_w = float(obs["width"]) / 2.0 + obstacle_inflation
 
-        radius = np.hypot(half_l, half_w)
+        c = np.cos(yaw)
+        s = np.sin(yaw)
 
-        x_min, y_min = _world_to_grid_local(cx - radius, cy - radius)
-        x_max, y_max = _world_to_grid_local(cx + radius, cy + radius)
+        corners = [
+            (half_l, half_w),
+            (half_l, -half_w),
+            (-half_l, -half_w),
+            (-half_l, half_w),
+        ]
 
-        x_min = max(0, x_min)
-        y_min = max(0, y_min)
-        x_max = min(width_cells - 1, x_max)
-        y_max = min(height_cells - 1, y_max)
+        points = []
 
-        cos_yaw = np.cos(yaw)
-        sin_yaw = np.sin(yaw)
+        for lx, ly in corners:
+            wx = cx + c * lx - s * ly
+            wy = cy + s * lx + c * ly
+            gx, gy = _world_to_grid_local(wx, wy)
+            points.append([gx, gy])
 
-        for y_idx in range(y_min, y_max + 1):
-            for x_idx in range(x_min, x_max + 1):
-                wx = gridmap.origin_x + x_idx * gridmap.resolution
-                wy = gridmap.origin_y + y_idx * gridmap.resolution
-
-                dx = wx - cx
-                dy = wy - cy
-
-                # Transform world point into obstacle-local frame
-                local_x = cos_yaw * dx + sin_yaw * dy
-                local_y = -sin_yaw * dx + cos_yaw * dy
-
-                if abs(local_x) <= half_l and abs(local_y) <= half_w:
-                    gridmap.occupancy[y_idx, x_idx] = 1
+        cv2.fillPoly(gridmap.occupancy, [np.array(points, dtype=np.int32)], 1)
 
     # Distance map: distance to nearest occupied cell in meters
     try:
@@ -609,70 +583,36 @@ def is_inside_grid(gridmap: GridMap3D, node) -> bool:
 
     return 0 <= x_idx < width and 0 <= y_idx < height
 
-def rollout_motion(current: Node, steer: float, direction: int, step_length: float, samples: int = 12):
-    x = float(current.x)
-    y = float(current.y)
+def rollout_motion(current: Node, steer: float, direction: int, step_length: float):
     theta = float(current.theta)
+    curvature = np.tan(steer) / vehicle.wheelbase
+    dtheta = direction * step_length * curvature
 
-    ds = step_length / samples
-    segment_points = []
+    if abs(curvature) < 1e-9:
+        x = current.x + direction * step_length * np.cos(theta)
+        y = current.y + direction * step_length * np.sin(theta)
+    else:
+        x = current.x + (np.sin(theta + dtheta) - np.sin(theta)) / curvature
+        y = current.y + (-np.cos(theta + dtheta) + np.cos(theta)) / curvature
 
-    for _ in range(samples):
-        x += direction * ds * np.cos(theta)
-        y += direction * ds * np.sin(theta)
-        theta += direction * ds / vehicle.wheelbase * np.tan(steer)
-        theta = normalize_angle(theta)
-
-        segment_points.append(
-            Node(
-                x=x,
-                y=y,
-                theta=theta,
-                idx=(-1, -1, -1),
-                steer=steer,
-                direction=direction,
-                motion_length=ds,
-            )
-        )
-
-    return x, y, theta, segment_points
+    return float(x), float(y), normalize_angle(theta + dtheta)
 
 def node_expansion(current: Node, gridmap: GridMap3D, end: Node) -> list[Node]:
-    global vehicle
     children = []
-
-    dist_to_goal = heuristic_cost(current, end)
+    dist_to_goal = position_distance(current, end)
+    step_length = config.near_goal_dsize if dist_to_goal < config.near_goal_radius else config.dsize
 
     if dist_to_goal < config.near_goal_radius:
-        step_length = config.near_goal_dsize
+        steering_angles = vehicle.steering_angles
     else:
-        step_length = config.dsize
+        m = vehicle.max_steering
+        steering_angles = [-m, -0.5 * m, 0.0, 0.5 * m, m]
 
     for direction in vehicle.directions:
-        for steer in vehicle.steering_angles:
-            x_new, y_new, theta_new, segment_points = rollout_motion(
-                current=current,
-                steer=steer,
-                direction=direction,
-                step_length=step_length,
-                samples=12,
-            )
-
-            idx_new = make_idx(x_new, y_new, theta_new, gridmap)
-
-            child = Node(
-                x=x_new,
-                y=y_new,
-                theta=theta_new,
-                idx=idx_new,
-                parent=current,
-                steer=steer,
-                direction=direction,
-                motion_length=step_length,
-                segment_points=segment_points,
-            )
-
-            children.append(child)
+        for steer in steering_angles:
+            x, y, theta = rollout_motion(current, steer, direction, step_length)
+            idx = make_idx(x, y, theta, gridmap)
+            children.append(Node(x=x, y=y, theta=theta, idx=idx, parent=current, steer=steer, direction=direction, motion_length=step_length))
 
     return children
 

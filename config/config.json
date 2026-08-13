@@ -1,7 +1,8 @@
 {
-  "source_type": "image",
-  "image": {
-    "path": "../example_frame/image1.png"
+  "source_type": "video",
+  "video": {
+    "path": "Video3.mp4",
+    "loop": true
   },
   "Camera": {
     "device_id": 0,

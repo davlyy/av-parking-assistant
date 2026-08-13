@@ -68,6 +68,10 @@ class CarlaScenarioConfig:
     ego_vehicle: EgoVehicleConfig = field(default_factory=EgoVehicleConfig)
     boundaries: BoundariesConfig | None = None
 
+@dataclass(frozen=True)
+class VideoConfig:
+    path: str
+    loop: bool = True
 
 @dataclass(frozen=True)
 class CarlaCameraConfig:
@@ -101,6 +105,7 @@ class SourceConfig:
     camera: CameraSetup | None = None
     carla: CarlaConfig | None = None
     image: ImageConfig | None = None
+    video: VideoConfig | None = None
 
 
 def _dict_to_dataclass(d: dict, cls):
@@ -167,6 +172,7 @@ def load_config(path: str | Path) -> SourceConfig:
     camera = None
     carla = None
     image = None
+    video = None
 
     if source_type == "camera":
         cam = _pick(raw, "Camera", "camera")
@@ -188,6 +194,14 @@ def load_config(path: str | Path) -> SourceConfig:
         if img:
             image = ImageConfig(
                 path=img["path"],
+            )
+    elif source_type == "video":
+        vid = _pick(raw, "Video", "video")
+
+        if vid:
+            video = VideoConfig(
+                path=vid["path"],
+                loop=vid.get("loop", True),
             )
 
     elif source_type == "carla":
@@ -223,4 +237,5 @@ def load_config(path: str | Path) -> SourceConfig:
         camera=camera,
         carla=carla,
         image=image,
+        video=video
     )

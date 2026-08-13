@@ -1,371 +1,298 @@
 from __future__ import annotations
-
 import argparse
-import dataclasses
-import json
 import math
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
-import numpy as np
 
-from input import load_config, CameraSource, CarlaSource, ImageSource, SourceConfig
-from mod.path_planning import convert_payload_to_carla_world, plan_path
-from mod.draw import (
-    draw_box_on_frame,
-    draw_scene_on_frame,
-    draw_slot_overlay,
-    draw_path_to_goal_on_frame,
-    get_parking_slots,
-    make_projector,
-    make_slot_overlay_mouse_callback,
-    set_goal_from_slot,
-    resize_for_display,
-    draw_drivable_area_on_frame
-)
+from frame_analyze import process_frame, YOLO_MODEL_PATH
+from input import load_config, CameraSource, ImageSource, VideoSource, SourceConfig
+from mod.path_planning import plan_path
+from mod.draw import draw_scene_on_frame, draw_slot_overlay, draw_path_to_goal_on_frame, get_parking_slots, make_projector, make_slot_overlay_mouse_callback, set_goal_from_slot, resize_for_display, draw_drivable_area_on_frame
 
+PATH_PREPLAN_DEVIATION = 0.4
+PATH_REPLAN_DEVIATION = 0.6
+GOAL_PREPLAN_DISTANCE = 0.3
+GOAL_REPLAN_DISTANCE = 0.5
+GOAL_PREPLAN_YAW = math.radians(10)
+GOAL_REPLAN_YAW = math.radians(15)
+GOAL_REACHED_DISTANCE = 0.6
+OBSTACLE_PATH_MARGIN = 0.3
+PREPLAN_OBSTACLE_PATH_MARGIN = 0.6
+PREPLAN_END_NODES = 6
+REPLAN_END_NODES = 2
+REPLAN_COOLDOWN_FRAMES = 10
 
 def create_source(config: SourceConfig):
-    if config.source_type == "carla":
-        if config.carla is None:
-            raise ValueError("CARLA config missing")
-        return CarlaSource(config.carla)
-
-    if config.source_type == "camera":
-        if config.camera is None:
-            raise ValueError("Camera config missing")
-        return CameraSource(config.camera)
-
-    if config.source_type == "image":
-        if config.image is None:
-            raise ValueError("Image config missing")
-        return ImageSource(config.image)
-
+    if config.source_type == "camera": return CameraSource(config.camera)
+    if config.source_type == "image": return ImageSource(config.image)
+    if config.source_type == "video": return VideoSource(config.video)
     raise ValueError(f"Unknown source_type: {config.source_type}")
 
-
 def ensure_bgr(frame):
-    if frame is None:
-        return None
-    if len(frame.shape) == 3 and frame.shape[2] == 4:
-        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    if frame is not None and len(frame.shape) == 3 and frame.shape[2] == 4: return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
     return frame
 
-
-def _draw_coords(frame, source) -> None:
-    if not isinstance(source, CarlaSource):
-        return
-
-    x, y, z, yaw = source.vehicle_pose()
-    for i, line in enumerate([f"X: {x:.1f}", f"Y: {y:.1f}", f"Z: {z:.1f}", f"Yaw: {yaw:.1f}"]):
-        cv2.putText(frame, line, (10, 30 + i * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-def carla_yaw_to_rad(yaw_deg: float) -> float:
-    return math.radians(float(yaw_deg))
-
-def current_source_pose(source, fallback_payload: dict | None = None) -> dict | None:
-    if isinstance(source, CarlaSource):
-        x, y, z, yaw_deg = source.vehicle_pose()
-        return {
-            "x": float(x),
-            "y": float(y),
-            "yaw": carla_yaw_to_rad(yaw_deg),
-        }
-
-    if fallback_payload is not None and "start_pose" in fallback_payload:
-        pose = fallback_payload["start_pose"]
-        return {
-            "x": float(pose["x"]),
-            "y": float(pose["y"]),
-            "yaw": float(pose.get("yaw", 0.0)),
-        }
-
-    return None
-
-
-def get_planner_goal_tolerance(default: float = 3.0) -> float:
-    planner_cfg = getattr(plan_path, "__globals__", {}).get("config", None)
-    return float(getattr(planner_cfg, "goal_tolerance", default)) if planner_cfg else default
-
-
-def distance_xy(a: dict | None, b: dict | None) -> float:
-    if a is None or b is None:
-        return float("inf")
+def distance_xy(a: dict, b: dict) -> float:
     return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"]))
 
+def angle_distance(a: float, b: float) -> float:
+    return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
 
-def is_within_goal_tolerance(pose: dict | None, goal_pose: dict | None, goal_tolerance: float) -> bool:
-    return distance_xy(pose, goal_pose) <= goal_tolerance
+def slot_distance(a: dict, b: dict) -> float:
+    return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"]))
 
+def goal_difference(slot: dict, goal: dict | None):
+    if goal is None: return float("inf"), float("inf")
+    return slot_distance(slot, goal), angle_distance(float(slot.get("yaw", 0.0)), float(goal.get("yaw", 0.0)))
 
-def closest_path_index(path, pose: dict | None, start_index: int = 0, search_back: int = 5, search_forward: int = 120) -> tuple[int, float]:
-    if not path or pose is None:
-        return 0, float("inf")
-
+def closest_path_index(path, pose: dict, start_index=0):
+    if not path: return 0, float("inf")
+    start = max(0, start_index - 5)
     px, py = float(pose["x"]), float(pose["y"])
-    start = max(0, start_index - search_back)
-    end = min(len(path), start_index + search_forward)
+    best_index, best_distance = start, float("inf")
+    for i in range(start, len(path)):
+        d = math.hypot(float(path[i].x) - px, float(path[i].y) - py)
+        if d < best_distance:
+            best_distance, best_index = d, i
+    return best_index, best_distance
 
-    best_index = start
-    best_dist = float("inf")
+def trim_path_for_display(path, current_pose: dict, path_index: int):
+    if not path: return []
+    path_index = max(0, min(path_index, len(path) - 1))
+    current = SimpleNamespace(x=float(current_pose["x"]), y=float(current_pose["y"]))
+    return [current] + list(path[path_index:])
 
-    for i in range(start, end):
-        node = path[i]
-        dist = math.hypot(float(node.x) - px, float(node.y) - py)
-        if dist < best_dist:
-            best_dist = dist
-            best_index = i
+def path_blocked(path, obstacles, start_index: int, margin: float):
+    if not path: return False
+    for node in path[start_index:]:
+        for obs in obstacles:
+            cx, cy = float(obs["x"]), float(obs["y"])
+            yaw = float(obs.get("yaw", 0.0))
+            dx, dy = float(node.x) - cx, float(node.y) - cy
+            c, s = math.cos(yaw), math.sin(yaw)
+            local_x, local_y = c * dx + s * dy, -s * dx + c * dy
+            half_l = float(obs["length"]) / 2 + margin
+            half_w = float(obs["width"]) / 2 + margin
+            if abs(local_x) <= half_l and abs(local_y) <= half_w: return True
+    return False
 
-    return best_index, best_dist
+def run_planner_async(payload, frame_id, reason):
+    t = time.perf_counter()
+    path = plan_path(payload, already_world=True)
+    return path, payload, frame_id, reason, time.perf_counter() - t
 
+def candidate_is_valid(candidate_path, candidate_payload, selected_slot, current_pose, obstacles):
+    if not candidate_path: return False, 0
+    goal_distance, goal_yaw = goal_difference(selected_slot, candidate_payload["goal_pose"])
+    if goal_distance > GOAL_REPLAN_DISTANCE or goal_yaw > GOAL_REPLAN_YAW: return False, 0
+    candidate_index, deviation = closest_path_index(candidate_path, current_pose)
+    if deviation > PATH_REPLAN_DEVIATION: return False, candidate_index
+    if path_blocked(candidate_path, obstacles, candidate_index, OBSTACLE_PATH_MARGIN): return False, candidate_index
+    return True, candidate_index
 
-def trim_path_for_display(path, current_pose: dict | None, progress_index: int):
-    if not path:
-        return []
-
-    progress_index = max(0, min(progress_index, len(path) - 1))
-    remaining = list(path[progress_index:])
-
-    if current_pose is None:
-        return remaining
-
-    current_node = SimpleNamespace(x=float(current_pose["x"]), y=float(current_pose["y"]))
-    return [current_node] + remaining
-
-def draw_top_status_banner(frame, text: str, color=(0, 255, 0)) -> None:
-    _, width = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.4
-    thickness = 3
-    padding_x = 28
-    padding_y = 18
-
-    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    box_w = text_w + 2 * padding_x
-    box_h = text_h + 2 * padding_y + baseline
-
-    x1 = (width - box_w) // 2
-    y1 = 20
-    x2 = x1 + box_w
-    y2 = y1 + box_h
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-    cv2.putText(frame, text, (x1 + padding_x, y1 + padding_y + text_h), font, font_scale, color, thickness)
-
-
-def run(source, config: SourceConfig, payload: dict) -> None:
+def run(source, config: SourceConfig) -> None:
     source.open()
-    path = []
+    selected_slot_index = 0
+    selected_slot_anchor = None
+    active_path = []
+    active_path_index = 0
+    active_planning_payload = None
+    planned_goal = None
+
+    planner_executor = ProcessPoolExecutor(max_workers=1)
+    planner_future = None
+    last_plan_submit_frame = -REPLAN_COOLDOWN_FRAMES
+    planner_total = 0.0
+    planner_calls = 0
+    planner_submitted = 0
+    planner_discarded = 0
+    replan_reasons = Counter()
+
+    overlay_state = {"buttons": [], "slot_polygons": [], "clicked_index": None, "display_scale": 1.0}
+    timing_sum = {"payload": 0.0, "prepare": 0.0, "planner": 0.0, "draw": 0.0, "total": 0.0}
+    timing_frames = 0
+
+    window_name = "AV Parking Assistant"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, make_slot_overlay_mouse_callback(overlay_state))
+    frame_id = 0
 
     try:
-        if isinstance(source, CarlaSource):
-            x, y, z, yaw_deg = source.vehicle_pose()
-
-            ego_world_pose = {
-                "x": float(x),
-                "y": float(y),
-                "yaw": carla_yaw_to_rad(yaw_deg),
-            }
-
-            print("CARLA ego pose:", {
-                "x": ego_world_pose["x"],
-                "y": ego_world_pose["y"],
-                "yaw_deg": float(yaw_deg),
-                "yaw_rad": ego_world_pose["yaw"],
-            })
-            base_payload = convert_payload_to_carla_world(payload, ego_world_pose)
-        else:
-            base_payload = payload.copy()
-
-        slots = get_parking_slots(base_payload)
-        if not slots:
-            raise ValueError("No free parking slots available")
-
-        project = make_projector(config, base_payload, source=source)
-
-        selected_slot_index = 0
-        planned_slot_index = None
-        planning_payload = None
-
-        path_progress_index = 0
-        path_replan_deviation = 0.5
-        goal_tolerance = get_planner_goal_tolerance(default=3.0)
-
-        overlay_state = {
-            "buttons": [],
-            "slot_polygons": [],
-            "clicked_index": None,
-            "display_scale": 1.0,
-        }
-
-        window_name = "AV Parking Assistant"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(window_name, make_slot_overlay_mouse_callback(overlay_state))
-
         for frame in source:
-            if frame is None:
-                break
-
+            t_frame = time.perf_counter()
             frame = ensure_bgr(frame)
+            if frame is None: break
 
+            t = time.perf_counter()
+            _, payload = process_frame(frame, frame_id=frame_id, detector="yolo", yolo_model_path=YOLO_MODEL_PATH, confidence=0.2, aruco_marker_size_mm=0.98 * 24, visualize=False)
+            t_payload = time.perf_counter() - t
+
+            if payload is None:
+                cv2.imshow(window_name, resize_for_display(frame)[0])
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27): break
+                frame_id += 1
+                continue
+
+            t = time.perf_counter()
+            slots = get_parking_slots(payload)
+            if not slots:
+                cv2.imshow(window_name, resize_for_display(frame)[0])
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27): break
+                frame_id += 1
+                continue
+
+            if selected_slot_anchor is not None:
+                selected_slot_index = min(range(len(slots)), key=lambda i: slot_distance(slots[i], selected_slot_anchor))
+            else:
+                selected_slot_index = min(selected_slot_index, len(slots) - 1)
+
+            force_replan = False
             if overlay_state["clicked_index"] is not None:
                 clicked = overlay_state["clicked_index"]
                 overlay_state["clicked_index"] = None
-
-                if 0 <= clicked < len(slots) and clicked != selected_slot_index:
+                if 0 <= clicked < len(slots):
                     selected_slot_index = clicked
-                    print("Selected slot by mouse:", selected_slot_index)
+                    selected_slot_anchor = slots[selected_slot_index].copy()
+                    force_replan = True
 
-            raw_key = cv2.waitKey(20)
-            if raw_key != -1:
-                key = raw_key & 0xFF
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27): break
 
-                if key == ord("q") or key == 27:
-                    break
+            old_index = selected_slot_index
+            if key == ord("w"): selected_slot_index = max(0, selected_slot_index - 1)
+            elif key == ord("s"): selected_slot_index = min(len(slots) - 1, selected_slot_index + 1)
+            elif ord("0") <= key <= ord("9") and int(chr(key)) < len(slots): selected_slot_index = int(chr(key))
 
-                char = chr(key).lower()
+            if selected_slot_index != old_index:
+                selected_slot_anchor = slots[selected_slot_index].copy()
+                force_replan = True
 
-                if char == "w":
-                    selected_slot_index = max(0, selected_slot_index - 1)
-                    print("Selected slot by key:", selected_slot_index)
-
-                elif char == "s":
-                    selected_slot_index = min(len(slots) - 1, selected_slot_index + 1)
-                    print("Selected slot by key:", selected_slot_index)
-
-                elif char.isdigit() and int(char) < len(slots):
-                    selected_slot_index = int(char)
-                    print("Selected slot by key:", selected_slot_index)
-
-            current_pose = current_source_pose(source, fallback_payload=base_payload)
             selected_slot = slots[selected_slot_index]
-            current_goal_pose = {
-                "x": float(selected_slot["x"]),
-                "y": float(selected_slot["y"]),
-                "yaw": float(selected_slot.get("yaw", 0.0)),
-            }
+            selected_slot_anchor = selected_slot.copy()
+            current_pose = payload["start_pose"]
+            obstacles = payload.get("obstacles", [])
+            planning_payload_current = set_goal_from_slot(payload.copy(), selected_slot)
+            project = make_projector(config, payload, source=source)
 
-            slot_changed = planned_slot_index != selected_slot_index
+            if planner_future is not None and planner_future.done():
+                try:
+                    candidate_path, candidate_payload, planned_frame, reason, planner_time = planner_future.result()
+                    planner_total += planner_time
+                    planner_calls += 1
+                    valid, candidate_index = candidate_is_valid(candidate_path, candidate_payload, selected_slot, current_pose, obstacles)
+
+                    if valid:
+                        active_path = candidate_path
+                        active_path_index = candidate_index
+                        active_planning_payload = candidate_payload
+                        planned_goal = candidate_payload["goal_pose"].copy()
+                        print(f"[Candidate accepted] frame={planned_frame} reason={reason} time={planner_time * 1000:.1f} ms")
+                    else:
+                        planner_discarded += 1
+                        print(f"[Candidate discarded] frame={planned_frame} reason={reason} time={planner_time * 1000:.1f} ms")
+                except Exception as error:
+                    planner_calls += 1
+                    planner_discarded += 1
+                    print(f"[Planner error] {error}")
+                planner_future = None
+
             path_deviation = float("inf")
+            if active_path:
+                active_path_index, path_deviation = closest_path_index(active_path, current_pose, active_path_index)
 
-            if path and not slot_changed:
-                closest_idx, path_deviation = closest_path_index(
-                    path, current_pose, start_index=path_progress_index, search_back=5, search_forward=120
-                )
-                path_progress_index = max(path_progress_index, closest_idx)
+            goal_distance_delta, goal_yaw_delta = goal_difference(selected_slot, planned_goal)
+            goal_pose = {"x": float(selected_slot["x"]), "y": float(selected_slot["y"]), "yaw": float(selected_slot.get("yaw", 0.0))}
+            distance_to_goal = distance_xy(current_pose, goal_pose)
+            remaining_nodes = len(active_path) - active_path_index if active_path else 0
 
-            off_path = bool(path) and path_deviation > path_replan_deviation
-            needs_replan = planning_payload is None or slot_changed or off_path
+            hard_off_path = bool(active_path) and path_deviation > PATH_REPLAN_DEVIATION
+            pre_off_path = bool(active_path) and path_deviation > PATH_PREPLAN_DEVIATION
+            hard_goal_changed = planned_goal is not None and (goal_distance_delta > GOAL_REPLAN_DISTANCE or goal_yaw_delta > GOAL_REPLAN_YAW)
+            pre_goal_changed = planned_goal is not None and (goal_distance_delta > GOAL_PREPLAN_DISTANCE or goal_yaw_delta > GOAL_PREPLAN_YAW)
+            hard_blocked = path_blocked(active_path, obstacles, active_path_index, OBSTACLE_PATH_MARGIN)
+            pre_blocked = path_blocked(active_path, obstacles, active_path_index, PREPLAN_OBSTACLE_PATH_MARGIN)
+            hard_path_end = bool(active_path) and remaining_nodes <= REPLAN_END_NODES and distance_to_goal > GOAL_REACHED_DISTANCE
+            pre_path_end = bool(active_path) and remaining_nodes <= PREPLAN_END_NODES and distance_to_goal > GOAL_REACHED_DISTANCE
+            cooldown_done = frame_id - last_plan_submit_frame >= REPLAN_COOLDOWN_FRAMES
 
-            if needs_replan:
-                planning_payload = base_payload.copy()
-                planning_payload["start_pose"] = {
-                    "x": float(current_pose["x"]),
-                    "y": float(current_pose["y"]),
-                    "yaw": float(current_pose.get("yaw", 0.0)),
-                }
-                planning_payload = set_goal_from_slot(planning_payload, selected_slot)
+            plan_reason = None
+            if force_replan: plan_reason = "slot"
+            elif not active_path: plan_reason = "initial"
+            elif hard_off_path: plan_reason = "off_path"
+            elif hard_goal_changed: plan_reason = "goal_changed"
+            elif hard_blocked: plan_reason = "blocked"
+            elif hard_path_end: plan_reason = "path_finished"
+            elif cooldown_done:
+                if pre_off_path: plan_reason = "pre_off_path"
+                elif pre_goal_changed: plan_reason = "pre_goal_changed"
+                elif pre_blocked: plan_reason = "pre_blocked"
+                elif pre_path_end: plan_reason = "pre_path_finished"
 
-                print(
-                    "Replanning:",
-                    "slot_changed=", slot_changed,
-                    "off_path=", off_path,
-                    "path_deviation=", round(path_deviation, 2) if path_deviation != float("inf") else "inf",
-                    "threshold=", path_replan_deviation,
-                    "slot=", selected_slot.get("id", selected_slot_index),
-                    "start=", planning_payload["start_pose"],
-                    "goal=", planning_payload["goal_pose"],
-                )
+            if plan_reason is not None and planner_future is None:
+                planner_future = planner_executor.submit(run_planner_async, planning_payload_current, frame_id, plan_reason)
+                planner_submitted += 1
+                replan_reasons[plan_reason] += 1
+                last_plan_submit_frame = frame_id
+                print(f"[Planner start] frame={frame_id} reason={plan_reason}")
 
-                path = plan_path(planning_payload, already_world=True)
-                print("Path length:", len(path) if path else 0)
+            t_prepare = time.perf_counter() - t
+            t_planner = 0.0
 
-                if path:
-                    reverse_count = sum(1 for node in path if getattr(node, "direction", 1) < 0)
-                    forward_count = sum(1 for node in path if getattr(node, "direction", 1) > 0)
-
-                    print("Forward nodes:", forward_count)
-                    print("Reverse nodes:", reverse_count)
-
-                planned_slot_index = selected_slot_index
-                path_progress_index = 0
-
-                if path:
-                    closest_idx, _ = closest_path_index(
-                        path, current_pose, start_index=0, search_back=0, search_forward=min(len(path), 200)
-                    )
-                    path_progress_index = closest_idx
-
-            parked = is_within_goal_tolerance(current_pose, current_goal_pose, goal_tolerance)
-            parked_slot_index = selected_slot_index if parked else None
-
+            t = time.perf_counter()
             display_frame = frame.copy()
-            draw_drivable_area_on_frame(display_frame, planning_payload if planning_payload else base_payload)
+            draw_drivable_area_on_frame(display_frame, payload)
+            _, scale = resize_for_display(display_frame, max_w=1400, max_h=950)
+            overlay_state["display_scale"] = scale
+            draw_scene_on_frame(display_frame, payload, slots, selected_slot_index, project, overlay_state)
 
-            _, display_scale = resize_for_display(display_frame, max_w=1400, max_h=950)
-            overlay_state["display_scale"] = display_scale
-
-            draw_scene_on_frame(display_frame, base_payload, slots, selected_slot_index, project, overlay_state)
-
-            if parked_slot_index is not None:
-                draw_box_on_frame(display_frame, slots[parked_slot_index], project, label="", color=(0, 255, 0), thickness=4)
-
-            display_path = trim_path_for_display(path, current_pose, path_progress_index)
-
-            if display_path and planning_payload is not None:
-                draw_path_to_goal_on_frame(
-                    display_frame,
-                    display_path,
-                    project,
-                    goal_pose=planning_payload["goal_pose"],
-                    color=(0, 0, 255),
-                    thickness=2,
-                    stride=1,
-                )
-
-            if isinstance(source, CarlaSource):
-                _draw_coords(display_frame, source)
+            display_path = trim_path_for_display(active_path, current_pose, active_path_index)
+            if display_path and active_planning_payload is not None:
+                draw_path_to_goal_on_frame(display_frame, display_path, project, active_planning_payload["goal_pose"], thickness=2)
 
             draw_slot_overlay(display_frame, slots, selected_slot_index, overlay_state)
+            display_frame, scale = resize_for_display(display_frame, max_w=1400, max_h=950)
+            overlay_state["display_scale"] = scale
+            t_draw = time.perf_counter() - t
 
-            if parked_slot_index is not None:
-                draw_top_status_banner(display_frame, "PARKED", color=(0, 255, 0))
-
-            display_frame, display_scale = resize_for_display(display_frame, max_w=1400, max_h=950)
             cv2.imshow(window_name, display_frame)
+            t_total = time.perf_counter() - t_frame
+            timings = {"payload": t_payload, "prepare": t_prepare, "planner": t_planner, "draw": t_draw, "total": t_total}
+
+            for name, value in timings.items(): timing_sum[name] += value
+            timing_frames += 1
+            frame_id += 1
+
+            if timing_frames % 30 == 0:
+                values = " | ".join(f"{name}: {timing_sum[name] / timing_frames * 1000:.1f} ms" for name in timings)
+                planner_avg = planner_total / planner_calls * 1000 if planner_calls else 0.0
+                planner_state = "running" if planner_future is not None else "idle"
+                print(f"[Timing] {values} | planner={planner_state} | plans: {planner_calls}/{planner_submitted} | discarded: {planner_discarded} | planner/call: {planner_avg:.1f} ms")
 
     finally:
+        if planner_future is not None: planner_future.cancel()
+        planner_executor.shutdown(wait=False, cancel_futures=True)
+
+        if timing_frames:
+            values = " | ".join(f"{name}: {timing_sum[name] / timing_frames * 1000:.1f} ms" for name in timing_sum)
+            planner_avg = planner_total / planner_calls * 1000 if planner_calls else 0.0
+            print(f"[Timing final] {values} | plans: {planner_calls}/{planner_submitted} | discarded: {planner_discarded} | planner/call: {planner_avg:.1f} ms")
+            if replan_reasons:
+                print("[Planner reasons] " + " | ".join(f"{reason}: {count}" for reason, count in replan_reasons.most_common()))
+
         source.release()
         cv2.destroyAllWindows()
 
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AV Parking Assistant")
-    parser.add_argument("--source", choices=["camera", "carla", "image"], default="camera")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=str(Path(__file__).resolve().parent.parent / "config" / "config.json"))
-    parser.add_argument("--scenario", type=str, default="scenario_1")
     args = parser.parse_args()
-
     config = load_config(args.config)
-
-    if args.scenario and config.carla and args.scenario in config.carla.scenarios:
-        preset = config.carla.scenarios[args.scenario]
-        config = dataclasses.replace(
-            config,
-            carla=dataclasses.replace(config.carla, scenario=preset, scenario_name=args.scenario),
-        )
-
-    payload_path = Path(__file__).resolve().parent.parent / "config" / "payload.json"
-    with open(payload_path, encoding="utf-8") as f:
-        payload = json.load(f)
-
-    source = create_source(config)
-    run(source, config, payload)
-
+    run(create_source(config), config)
 
 if __name__ == "__main__":
     main()

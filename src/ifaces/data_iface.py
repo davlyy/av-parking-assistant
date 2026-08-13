@@ -13,7 +13,7 @@ class Config:
     omega_3 = 5.0
     d0 = 1.5
     epsilon = 0.1
-    heuristic_weight = 1.5
+    heuristic_weight = 2.5
     search_margin: float = 20.0
 
     goal_tolerance: float = 1.2

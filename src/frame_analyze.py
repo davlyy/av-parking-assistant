@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 import os
 import json
+from collections import deque
 
 from inference_sdk import InferenceConfiguration, InferenceHTTPClient
 from dotenv import load_dotenv
@@ -14,8 +15,23 @@ load_dotenv()
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = "parking-lot-npjkj/2"
 YOLO_MODEL_PATH = "besttoy.pt"
+DEBUG = False
+ARUCO_UPDATE_INTERVAL = 5
+YOLO_IMGSZ = 640
+
+_cached_parking_mat_corners = None
+_cached_input_calibration = None
 _yolo_model = None
 _yolo_model_path = None
+_ego_track_id = None
+_ego_last = None
+_ego_velocity = np.zeros(2, dtype=np.float32)
+_ego_missing_frames = 0
+_ego_reacquire_votes = deque(maxlen=5)
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
 
 # Vehicle spec (Lincoln MKZ 2017) — ground truth for calibration
 VEHICLE_SPEC = {
@@ -145,23 +161,21 @@ def detect_aruco_markers(frame):
     }
 
 
-def find_aruco_mat_corners(frame):
-    """Return the four parking-mat bounds defined by ArUco markers 0--3.
+def find_aruco_mat_corners(frame, detected=None):
+    if detected is None:
+        detected = detect_aruco_markers(frame)
 
-    Each marker sits just outside one mat corner.  The marker vertex closest
-    to the centre of all four markers is the vertex facing into the mat, so
-    those four vertices form a stable quadrilateral for rectification.
-    """
-    detected = detect_aruco_markers(frame)
     if detected.keys() != ARUCO_CORNER_IDS:
         return None
 
     marker_centres = np.array([corners.mean(axis=0) for corners in detected.values()])
     mat_centre = marker_centres.mean(axis=0)
+
     inner_corners = [
         corners[np.argmin(np.linalg.norm(corners - mat_centre, axis=1))]
         for corners in detected.values()
     ]
+
     return _order_quad_points(inner_corners)
 
 
@@ -185,52 +199,48 @@ def find_parking_lot_corners(frame):
     return _order_quad_points(cv2.boxPoints(cv2.minAreaRect(parking_lot_contour)))
 
 
-def find_parking_mat_bounds(frame):
-    """Return parking-mat corners in the original image pixel coordinates.
+def find_parking_mat_bounds(frame, detected=None):
+    corners = find_aruco_mat_corners(frame, detected)
 
-    Stage 0 deliberately does not crop or rectify the frame.  It records the
-    marker-defined quadrilateral in the payload while all detection and
-    visualization continue to use the unmodified camera image.
-    """
-    corners = find_aruco_mat_corners(frame)
     if corners is not None:
-        print("[Stage 0] Found parking-mat bounds from four ArUco markers")
+        debug_print("[Stage 0] Found parking-mat bounds from four ArUco markers")
         return corners
 
-    print("[Stage 0] ArUco bounds unavailable; using dark-surface bounds")
+    debug_print("[Stage 0] ArUco bounds unavailable; using dark-surface bounds")
+
     try:
         return find_parking_lot_corners(frame)
     except ValueError as error:
-        print(f"[Stage 0] Parking-mat bounds unavailable: {error}")
+        debug_print(f"[Stage 0] Parking-mat bounds unavailable: {error}")
         return None
 
 
 #[Stage 1] Input Calibration from ArUco Markers
-def calibrate_input_from_aruco(frame, marker_size_mm=None):
-    """Calibrate image scale from the known printed ArUco-marker side length.
-
-    The marker's four edges give pixels-per-metre.  This is a local image
-    scale (not a camera intrinsic/extrinsic calibration); perspective means
-    it should not be used as a global image-to-metre homography.
-    """
+def calibrate_input_from_aruco(frame, marker_size_mm=None, detected=None):
     if marker_size_mm is None:
-        print("[Stage 1] ArUco marker size not provided; calibration omitted")
         return None
+
     if marker_size_mm <= 0:
         raise ValueError("marker_size_mm must be greater than zero")
 
-    detected = detect_aruco_markers(frame)
+    if detected is None:
+        detected = detect_aruco_markers(frame)
+
     if not detected:
         return None
 
     edge_lengths_px = []
+
     for corners in detected.values():
         edge_lengths_px.extend(
             np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1)
         )
+
     marker_size_m = marker_size_mm / 1000.0
     pixels_per_metre = float(np.mean(edge_lengths_px) / marker_size_m)
-    print(f"[Stage 1] Calibrated {pixels_per_metre:.2f} px/m from {len(detected)} ArUco marker(s)")
+
+    debug_print(f"[Stage 1] Calibrated {pixels_per_metre:.2f} px/m from {len(detected)} ArUco marker(s)")
+
     return {
         "type": "marker_size_scale",
         "image_coordinate_space": "pixels",
@@ -512,64 +522,95 @@ def detect_vehicles(frame):
 
 
 def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
-    """Detect ``cars`` and ``free``/``avail`` slots using a local YOLO model.
-
-    Returns the same ``cars, avail, raw_predictions`` structure as
-    ``detect_vehicles`` so downstream ego, occupancy, and payload logic is
-    unchanged. YOLO class labels ``car``/``cars`` map to cars and
-    ``free``/``avail`` map to available slots.
-    """
     global _yolo_model, _yolo_model_path
 
     model_path = str(Path(model_path))
-    if not Path(model_path).is_file():
-        raise FileNotFoundError(f"YOLO model not found: {model_path}")
 
     if _yolo_model is None or _yolo_model_path != model_path:
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f"YOLO model not found: {model_path}")
+
         try:
             from ultralytics import YOLO
         except ImportError as error:
-            raise RuntimeError(
-                "YOLO detection requires ultralytics. Run: pip install ultralytics"
-            ) from error
+            raise RuntimeError("YOLO detection requires ultralytics. Run: pip install ultralytics") from error
+
         _yolo_model = YOLO(model_path)
         _yolo_model_path = model_path
 
-    result = _yolo_model.predict(frame, conf=confidence, verbose=False)[0]
+    result = _yolo_model.track(
+        frame,
+        conf=confidence,
+        persist=True,
+        tracker="botsort.yaml",
+        imgsz=YOLO_IMGSZ,
+        verbose=False,
+    )[0]
+
+    boxes = result.boxes
     names = result.names
-    cars, avail, predictions = [], [], []
-    for box in result.boxes:
-        x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
-        class_id = int(box.cls[0].item())
+
+    if len(boxes) == 0:
+        return [], [], []
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    class_ids = boxes.cls.int().cpu().numpy()
+    confidences = boxes.conf.cpu().numpy()
+    track_ids = boxes.id.int().cpu().numpy() if boxes.id is not None else [None] * len(boxes)
+
+    cars = []
+    avail = []
+    predictions = []
+
+    for coords, class_id, conf, track_id in zip(xyxy, class_ids, confidences, track_ids):
+        x1, y1, x2, y2 = coords
+
+        class_id = int(class_id)
+        conf = float(conf)
+        track_id = int(track_id) if track_id is not None else None
         class_name = str(names[class_id])
-        conf = float(box.conf[0].item())
-        width, height = x2 - x1, y2 - y1
+
+        x = float((x1 + x2) / 2)
+        y = float((y1 + y2) / 2)
+        width = float(x2 - x1)
+        height = float(y2 - y1)
+
         prediction = {
-            "x": (x1 + x2) / 2,
-            "y": (y1 + y2) / 2,
+            "x": x,
+            "y": y,
             "width": width,
             "height": height,
             "confidence": conf,
             "class": class_name,
             "class_id": class_id,
+            "track_id": track_id,
         }
-        predictions.append(prediction)
+
         entry = {
-            "x": prediction["x"], "y": prediction["y"],
-            "width": width, "height": height,
-            "conf": conf, "class": class_name,
-            "center_px": (prediction["x"], prediction["y"]),
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "conf": conf,
+            "class": class_name,
+            "center_px": (x, y),
             "size_px": (width, height),
             "bbox_px": (int(x1), int(y1), int(x2), int(y2)),
+            "track_id": track_id,
         }
+
+        predictions.append(prediction)
+
         label = class_name.lower()
+
         if label in {"car", "cars"}:
             cars.append(entry)
         elif label in {"free", "avail"}:
             avail.append(entry)
 
-    print(f"[Debug] YOLO raw predictions: {len(predictions)}")
-    print(f"[Debug] YOLO Cars: {len(cars)}, Available slots: {len(avail)}")
+    debug_print(f"[Debug] YOLO raw predictions: {len(predictions)}")
+    debug_print(f"[Debug] YOLO Cars: {len(cars)}, Available slots: {len(avail)}")
+
     return cars, avail, predictions
 
 
@@ -604,6 +645,64 @@ def identify_ego(cars, frame):
     obstacles = [c for c in cars if c is not ego]
     return ego, obstacles
 
+def select_ego(cars, frame, max_missing=8):
+    global _ego_track_id, _ego_last, _ego_velocity, _ego_missing_frames, _ego_reacquire_votes
+
+    if _ego_track_id is None:
+        ego, _ = identify_ego(cars, frame)
+        if ego is None or ego.get("track_id") is None:
+            return None
+        _ego_track_id = ego["track_id"]
+        _ego_last = ego.copy()
+        _ego_missing_frames = 0
+        print("Ego track initialized:", _ego_track_id)
+        return ego
+
+    ego = next((car for car in cars if car.get("track_id") == _ego_track_id), None)
+
+    if ego is not None:
+        if _ego_last is not None:
+            _ego_velocity[:] = [ego["x"] - _ego_last["x"], ego["y"] - _ego_last["y"]]
+        _ego_last = ego.copy()
+        _ego_missing_frames = 0
+        _ego_reacquire_votes.clear()
+        return ego
+
+    _ego_missing_frames += 1
+
+    if _ego_last is not None and _ego_missing_frames <= max_missing:
+        ego = _ego_last.copy()
+        dx, dy = float(_ego_velocity[0]), float(_ego_velocity[1])
+        ego["x"] += dx
+        ego["y"] += dy
+        x1, y1, x2, y2 = ego["bbox_px"]
+        ego["bbox_px"] = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
+        ego["center_px"] = (ego["x"], ego["y"])
+        ego["tracked_only"] = True
+        _ego_last = ego
+        return ego
+
+    candidate, _ = identify_ego(cars, frame)
+
+    if candidate is None or candidate.get("track_id") is None:
+        return None
+
+    _ego_reacquire_votes.append(candidate["track_id"])
+
+    winner = max(set(_ego_reacquire_votes), key=_ego_reacquire_votes.count)
+
+    if _ego_reacquire_votes.count(winner) >= 3:
+        ego = next((car for car in cars if car.get("track_id") == winner), None)
+        if ego is not None:
+            print("Ego track reacquired:", _ego_track_id, "->", winner)
+            _ego_track_id = winner
+            _ego_last = ego.copy()
+            _ego_velocity[:] = 0
+            _ego_missing_frames = 0
+            _ego_reacquire_votes.clear()
+            return ego
+
+    return None
 
 def remove_slots_containing_ego(avail, ego):
     """Remove free-slot detections that fully contain the red ego car box."""
@@ -741,8 +840,9 @@ def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None,
         "vehicle": VEHICLE_SPEC
     }
 
-    print("\nA* Payload")
-    print(json.dumps(payload, indent=2))
+    if DEBUG:
+        print("\nA* Payload")
+        print(json.dumps(payload, indent=2))
     return payload
 
 #Visualization
@@ -839,36 +939,70 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
 
 def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
                   yolo_model_path=YOLO_MODEL_PATH, confidence=0.5,
-                  aruco_marker_size_mm=None):
+                  aruco_marker_size_mm=None, visualize=True):
     global PIXELS_PER_METER
-    # Stage 0: record the mat's four corners; retain the original camera frame.
-    parking_mat_corners = find_parking_mat_bounds(frame)
-    input_calibration = calibrate_input_from_aruco(frame, aruco_marker_size_mm)
+    global _cached_parking_mat_corners, _cached_input_calibration
 
-    # Stage 3: Roboflow detection → cars + available slots
-    # model_frame = prepare_model_input(frame)
-    cars, avail, raw_preds = run_vehicle_detector(
-        frame, detector, yolo_model_path, confidence
+    update_aruco = (
+        _cached_parking_mat_corners is None
+        or _cached_input_calibration is None
+        or frame_id % ARUCO_UPDATE_INTERVAL == 0
     )
 
-    # Stage 4: Identify ego vs obstacles
-    ego, obstacles = identify_ego(cars, frame)
+    if update_aruco:
+        detected = detect_aruco_markers(frame)
+
+        new_corners = find_parking_mat_bounds(frame, detected)
+        new_calibration = calibrate_input_from_aruco(
+            frame,
+            aruco_marker_size_mm,
+            detected,
+        )
+
+        if new_corners is not None:
+            _cached_parking_mat_corners = new_corners
+
+        if new_calibration is not None:
+            _cached_input_calibration = new_calibration
+
+    parking_mat_corners = _cached_parking_mat_corners
+    input_calibration = _cached_input_calibration
+
+    cars, avail, raw_preds = run_vehicle_detector(
+        frame,
+        detector,
+        yolo_model_path,
+        confidence,
+    )
+
+    ego = select_ego(cars, frame)
+    ego_track_id = ego.get("track_id") if ego else None
+
+    obstacles = [
+        car for car in cars
+        if car.get("track_id") != ego_track_id
+    ]
+
     avail = filter_slots_by_median_area(avail)
     avail = remove_slots_containing_ego(avail, ego)
-    print(f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
-          f"Obstacles: {len(obstacles)} | Available: {len(avail)}")
 
-    # Stage 4b: Calibrate px/m from ego vehicle bbox
-    if ego is not None:
-        PIXELS_PER_METER = calibrate_from_ego(ego)
-    else:
-        print("ERROR: No ego vehicle detected — cannot calibrate.")
-        print("Falling back to default 17.6 px/m (unreliable)")
-        PIXELS_PER_METER = 17.6
+    debug_print(
+        f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
+        f"Obstacles: {len(obstacles)} | Available: {len(avail)}"
+    )
 
-    # Stage 5: Build A* payload
+    if PIXELS_PER_METER is None:
+        if ego is not None and not ego.get("tracked_only", False):
+            PIXELS_PER_METER = calibrate_from_ego(ego)
+        else:
+            debug_print("Waiting for reliable ego detection before calibration")
+            result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
+            return result, None
+
     payload = build_astar_payload(
-        ego, obstacles, avail,
+        ego,
+        obstacles,
+        avail,
         frame_id=frame_id,
         image_width=frame.shape[1],
         image_height=frame.shape[0],
@@ -876,11 +1010,11 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
         input_calibration=input_calibration,
     )
 
-    # Visualization.  ``process_video`` writes this image to the annotated
-    # output video, so it must always be a valid frame rather than ``None``.
-    result = draw_detections(frame, cars, avail, ego, obstacles)
-    if debug_dir:
+    result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
+
+    if debug_dir and result is not None:
         _save_debug_image(debug_dir, "stage_5_final.png", result)
+
     return result, payload
 
 
