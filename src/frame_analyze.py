@@ -104,9 +104,6 @@ def dist(a, b):
 #[Stage 0] ArUco Parking-Mat Bounds Detection
 ARUCO_DICTIONARY = "DICT_4X4_50"
 ARUCO_CORNER_IDS = {0, 1, 2, 3}
-# The printed parking mat is A3 landscape (420 x 297 mm).
-PARKING_MAT_WIDTH_M = 0.420
-PARKING_MAT_HEIGHT_M = 0.297
 
 
 def _order_quad_points(points):
@@ -122,15 +119,10 @@ def _order_quad_points(points):
     return ordered
 
 
-def find_aruco_mat_corners(frame):
-    """Return the four parking-mat bounds defined by ArUco markers 0--3.
-
-    Each marker sits just outside one mat corner.  The marker vertex closest
-    to the centre of all four markers is the vertex facing into the mat, so
-    those four vertices form a stable quadrilateral for rectification.
-    """
+def detect_aruco_markers(frame):
+    """Detect expected ArUco markers, keyed by their IDs."""
     if not hasattr(cv2, "aruco"):
-        return None
+        return {}
 
     dictionary_id = getattr(cv2.aruco, ARUCO_DICTIONARY)
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
@@ -144,13 +136,23 @@ def find_aruco_mat_corners(frame):
             frame, dictionary, parameters=parameters)
 
     if marker_ids is None:
-        return None
+        return {}
 
-    detected = {
+    return {
         int(marker_id): corners.reshape(4, 2)
         for corners, marker_id in zip(marker_corners, marker_ids.ravel())
         if int(marker_id) in ARUCO_CORNER_IDS
     }
+
+
+def find_aruco_mat_corners(frame):
+    """Return the four parking-mat bounds defined by ArUco markers 0--3.
+
+    Each marker sits just outside one mat corner.  The marker vertex closest
+    to the centre of all four markers is the vertex facing into the mat, so
+    those four vertices form a stable quadrilateral for rectification.
+    """
+    detected = detect_aruco_markers(frame)
     if detected.keys() != ARUCO_CORNER_IDS:
         return None
 
@@ -204,35 +206,38 @@ def find_parking_mat_bounds(frame):
 
 
 #[Stage 1] Input Calibration from ArUco Markers
-def calibrate_input_from_aruco(frame):
-    """Calculate image-to-mat calibration without modifying the input frame.
+def calibrate_input_from_aruco(frame, marker_size_mm=None):
+    """Calibrate image scale from the known printed ArUco-marker side length.
 
-    Returns homographies between original image pixels and metres on the
-    printed A3 parking mat.  ``None`` means the four marker bounds were not
-    available for this frame.
+    The marker's four edges give pixels-per-metre.  This is a local image
+    scale (not a camera intrinsic/extrinsic calibration); perspective means
+    it should not be used as a global image-to-metre homography.
     """
-    parking_mat_corners = find_aruco_mat_corners(frame)
-    if parking_mat_corners is None:
+    if marker_size_mm is None:
+        print("[Stage 1] ArUco marker size not provided; calibration omitted")
+        return None
+    if marker_size_mm <= 0:
+        raise ValueError("marker_size_mm must be greater than zero")
+
+    detected = detect_aruco_markers(frame)
+    if not detected:
         return None
 
-    image_corners = np.asarray(parking_mat_corners, dtype=np.float32)
-    mat_corners_m = np.array([
-        [0.0, 0.0],
-        [PARKING_MAT_WIDTH_M, 0.0],
-        [PARKING_MAT_WIDTH_M, PARKING_MAT_HEIGHT_M],
-        [0.0, PARKING_MAT_HEIGHT_M],
-    ], dtype=np.float32)
-    image_to_mat = cv2.getPerspectiveTransform(image_corners, mat_corners_m)
-    mat_to_image = cv2.getPerspectiveTransform(mat_corners_m, image_corners)
-    print("[Stage 1] Calibrated original image coordinates from ArUco mat bounds")
+    edge_lengths_px = []
+    for corners in detected.values():
+        edge_lengths_px.extend(
+            np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1)
+        )
+    marker_size_m = marker_size_mm / 1000.0
+    pixels_per_metre = float(np.mean(edge_lengths_px) / marker_size_m)
+    print(f"[Stage 1] Calibrated {pixels_per_metre:.2f} px/m from {len(detected)} ArUco marker(s)")
     return {
-        "type": "homography",
+        "type": "marker_size_scale",
         "image_coordinate_space": "pixels",
-        "mat_coordinate_space": "metres",
-        "mat_width_m": PARKING_MAT_WIDTH_M,
-        "mat_height_m": PARKING_MAT_HEIGHT_M,
-        "H_image_to_mat": image_to_mat,
-        "H_mat_to_image": mat_to_image,
+        "marker_size_mm": marker_size_mm,
+        "markers_used": sorted(detected),
+        "pixels_per_metre": round(pixels_per_metre, 6),
+        "metres_per_pixel": round(1.0 / pixels_per_metre, 9),
     }
 
 
@@ -698,12 +703,7 @@ def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None,
                 )
             ],
         } if parking_mat_corners is not None else None,
-        "input_calibration": {
-            **{key: value for key, value in input_calibration.items()
-               if key not in {"H_image_to_mat", "H_mat_to_image"}},
-            "H_image_to_mat": np.asarray(input_calibration["H_image_to_mat"]).round(9).tolist(),
-            "H_mat_to_image": np.asarray(input_calibration["H_mat_to_image"]).round(6).tolist(),
-        } if input_calibration is not None else None,
+        "input_calibration": input_calibration,
         "projection": {
             "type": "homography",
             "H_world_to_image": world_to_image,
@@ -838,11 +838,12 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
 
 
 def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
-                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.5):
+                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.5,
+                  aruco_marker_size_mm=None):
     global PIXELS_PER_METER
     # Stage 0: record the mat's four corners; retain the original camera frame.
     parking_mat_corners = find_parking_mat_bounds(frame)
-    input_calibration = calibrate_input_from_aruco(frame)
+    input_calibration = calibrate_input_from_aruco(frame, aruco_marker_size_mm)
 
     # Stage 3: Roboflow detection → cars + available slots
     # model_frame = prepare_model_input(frame)
@@ -917,7 +918,7 @@ def test_model(frame, detector="roboflow", yolo_model_path=YOLO_MODEL_PATH,
 
 def process_video(input_path, output_path, sample_fps, payload_path,
                   detector="roboflow", yolo_model_path=YOLO_MODEL_PATH,
-                  confidence=0.2):
+                  confidence=0.2, aruco_marker_size_mm=None):
     """Process a video at ``sample_fps`` and write annotated video + payloads."""
     capture = cv2.VideoCapture(input_path)
     if not capture.isOpened():
@@ -949,7 +950,7 @@ def process_video(input_path, output_path, sample_fps, payload_path,
             result, payload = process_frame(
                 frame, debug_dir=None, frame_id=frame_id,
                 detector=detector, yolo_model_path=yolo_model_path,
-                confidence=confidence,
+                confidence=confidence, aruco_marker_size_mm=aruco_marker_size_mm,
             )
             if writer is None:
                 height, width = result.shape[:2]
@@ -997,12 +998,16 @@ if __name__ == "__main__":
                         help="Perception backend")
     parser.add_argument("--yolo-model", type=str, default=YOLO_MODEL_PATH,
                         help="Path to local YOLO weights used with --detector yolo")
-    parser.add_argument("--fps", type=float, default=10.0,
+    parser.add_argument("--fps", type=float, default=20.0,
                         help="Video processing rate in sampled frames per second")
+    parser.add_argument("--aruco-marker-size-mm", type=float, default=30.0,
+                        help="Physical side length of one printed ArUco marker in millimetres")
     args = parser.parse_args()
 
     if not 0.0 <= args.confidence <= 1.0:
         parser.error("--confidence must be between 0.0 and 1.0")
+    if args.aruco_marker_size_mm is not None and args.aruco_marker_size_mm <= 0:
+        parser.error("--aruco-marker-size-mm must be greater than zero")
     if args.detector == "roboflow":
         roboflow_client.configure(
             InferenceConfiguration(confidence_threshold=args.confidence)
@@ -1018,6 +1023,7 @@ if __name__ == "__main__":
             args.input, args.output, args.fps, args.payload,
             detector=args.detector, yolo_model_path=args.yolo_model,
             confidence=args.confidence,
+            aruco_marker_size_mm=args.aruco_marker_size_mm,
         )
         raise SystemExit(0)
 
@@ -1035,6 +1041,7 @@ if __name__ == "__main__":
         result, payload = process_frame(
             frame, debug_dir=args.debug_dir, detector=args.detector,
             yolo_model_path=args.yolo_model, confidence=args.confidence,
+            aruco_marker_size_mm=args.aruco_marker_size_mm,
         )
 
     # Save visualization
