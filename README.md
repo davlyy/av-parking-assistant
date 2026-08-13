@@ -55,25 +55,25 @@ python src/main.py --source camera --config config/config.json
 `frame_analyze.py` is an offline pipeline for the photographs in
 `example_frame/`. Stage 0 uses the four `DICT_4X4_50` ArUco markers with IDs
 0--3 at the parking-mat corners to add the four image-pixel coordinates to the
-payload as `parking_mat_bounds`. Stage 1 also uses those markers to add an
-image-pixel-to-mat-metre homography as `input_calibration`. The original camera
-frame is not cropped or rectified. If all four markers are not visible, it
-falls back to detecting the dark printed mat, but omits the marker calibration.
-The model must use `car` and `free` class labels. A predicted `free` box is
-accepted only when it overlaps a slot derived from the white T-shaped divider
-markings.
+payload as `parking_mat_bounds`. Stage 1 uses the measured side length of a
+printed marker (passed with `--aruco-marker-size-mm`) to add local image scale
+as `input_calibration`; it does not assume a paper size. The original camera
+frame is not cropped or rectified. If markers are unavailable, it falls back to
+detecting the dark printed mat, but omits marker calibration. The model must use
+`car` and `free` class labels. A predicted `free` box is accepted only when it
+overlaps a slot derived from the white T-shaped divider markings.
 
 ```bash
 ROBOFLOW_API_KEY=<your-key> python src/frame_analyze.py \
   --input example_frame/toy_1.jpg \
   --output result.png \
   --payload payload.json \
-  --mat-width-m 12 --mat-height-m 18
+  --aruco-marker-size-mm 30
 ```
 
-Set `--mat-width-m` and `--mat-height-m` to the dimensions represented by the
-printed mat. The payload's coordinate origin is the top-left of the cropped
-parking-lot image, with x growing right and y growing down.
+Replace `30` with the measured side length of one printed marker in mm. The
+payload coordinates remain in the original camera image, with x growing right
+and y growing down.
 
 ### Process a video
 
