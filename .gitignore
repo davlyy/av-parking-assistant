@@ -5,6 +5,6 @@ __pycache__/
 *.onnx
 data/raw/
 .env
-.idea
+debug_frames/
 carla
 !best.pt
