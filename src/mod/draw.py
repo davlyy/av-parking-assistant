@@ -5,9 +5,16 @@ import numpy as np
 from typing import Callable
 
 Projector = Callable[[float, float, np.ndarray], tuple[int, int]]
+ARUCO_WORLD = {
+    0: {"x": 0.00, "y": 0.00},
+    1: {"x": 1.80, "y": 0.00},
+    2: {"x": 1.80, "y": 2.40},
+    3: {"x": 0.00, "y": 2.40},
+}
 
 def draw_drivable_area_on_frame(frame, payload: dict) -> None:
     area = payload.get("drivable_area")
+    print("drivable_area:", payload.get("drivable_area"))
     if not area:
         return
 
@@ -85,26 +92,19 @@ def draw_box_on_frame(
     return pts
 
 def get_parking_slots(payload: dict) -> list[dict]:
+    if "parking_slots" in payload:
+        slots = [
+            {**slot, "id": int(slot.get("id", i))}
+            for i, slot in enumerate(payload["parking_slots"])
+        ]
+        return sorted(slots, key=lambda s: s["id"])
+
     if "available_parking_slots" in payload:
-        return [
-            {**slot, "id": i}
+        slots = [
+            {**slot, "id": int(slot.get("id", i))}
             for i, slot in enumerate(payload["available_parking_slots"])
         ]
-
-    if "parking_slots" in payload:
-        return [
-            {**slot, "id": slot.get("id", i)}
-            for i, slot in enumerate(payload["parking_slots"])
-            if slot.get("free", True)
-        ]
-
-    if "parking_slot" in payload:
-        slot = payload["parking_slot"]
-
-        if isinstance(slot, list):
-            return [{**s, "id": i} for i, s in enumerate(slot)]
-
-        return [{**slot, "id": 0}]
+        return sorted(slots, key=lambda s: s["id"])
 
     return []
 
@@ -363,87 +363,60 @@ def make_slot_overlay_mouse_callback(state: dict):
 
     return on_mouse
 
-def draw_slot_overlay(frame, slots: list[dict], selected_index: int, overlay_state: dict) -> None:
+def compose_frame_with_side_panel(frame, panel_width=420, gap=10):
     h, w = frame.shape[:2]
+    canvas = np.full((h, w + gap + panel_width, 3), 35, dtype=np.uint8)
+    canvas[:, :w] = frame
+    return canvas, (0, 0, w, h), (w + gap, 0, panel_width, h)
 
-    display_scale = float(overlay_state.get("display_scale", 1.0))
-    if display_scale <= 0:
-        display_scale = 1.0
-
-    inv = 1.0 / display_scale
-
-    panel_w = int(min(w * 0.48, 560 * inv))
-    row_h = int(44 * inv)
-    header_h = int(78 * inv)
-    pad = int(16 * inv)
-
-    margin_x = int(18 * inv)
-    margin_y = int(18 * inv)
-
-    panel_h = header_h + len(slots) * row_h + pad
-    x1 = w - panel_w - margin_x
-    y1 = margin_y
-    x2 = w - margin_x
-    y2 = min(h - margin_y, y1 + panel_h)
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (25, 25, 25), -1)
-    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
-
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), max(2, int(2 * inv)))
-
-    cv2.putText(
-        frame,
-        "Parking slot selection",
-        (x1 + int(16 * inv), y1 + int(34 * inv)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8 * inv,
-        (255, 255, 255),
-        max(1, int(2 * inv)),
-    )
-
-    cv2.putText(
-        frame,
-        "click / 0-9 / W-S / Q",
-        (x1 + int(16 * inv), y1 + int(60 * inv)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48 * inv,
-        (210, 210, 210),
-        max(1, int(1 * inv)),
-    )
-
+def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_rect, planner_state="idle"):
+    px, py, pw, ph = panel_rect
     overlay_state["buttons"] = []
 
-    y = y1 + header_h
+    cv2.rectangle(frame, (px, py), (px + pw - 1, py + ph - 1), (35, 35, 35), -1)
+
+    cv2.putText(frame, "Parking slot selection", (px + 18, py + 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, "click / 0-9 / W-S / Q", (px + 18, py + 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Planner: {planner_state}", (px + 18, py + 87),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+    if not slots:
+        cv2.putText(frame, "No free parking slots", (px + 18, py + 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
+        return
+
+    top = py + 110
+    bottom_margin = 15
+    available_height = max(1, ph - 110 - bottom_margin)
+    row_step = min(44, max(27, available_height // len(slots)))
+    row_height = max(23, row_step - 5)
 
     for i, slot in enumerate(slots):
-        bx1 = x1 + int(14 * inv)
-        by1 = y
-        bx2 = x2 - int(14 * inv)
-        by2 = y + int(32 * inv)
+        x1 = px + 14
+        x2 = px + pw - 14
+        y1 = top + i * row_step
+        y2 = min(y1 + row_height, py + ph - bottom_margin)
 
-        overlay_state["buttons"].append((i, (bx1, by1, bx2, by2)))
+        if y1 >= py + ph - bottom_margin:
+            break
 
-        selected = i == selected_index
-        border = (0, 255, 0) if selected else (120, 120, 120)
+        selected = i == selected_slot_index
+        fill = (45, 75, 45) if selected else (48, 48, 48)
+        border = (0, 255, 0) if selected else (110, 110, 110)
         text_color = (220, 255, 220) if selected else (220, 220, 220)
 
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (40, 40, 40), -1)
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), border, max(1, int((2 if selected else 1) * inv)))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), fill, -1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2 if selected else 1)
 
-        text = f"[{i}] slot {slot.get('id', i)}   x={slot['x']:.1f}   y={slot['y']:.1f}"
+        slot_id = slot.get("id", i)
+        text = f"[{i}] slot {slot_id}   x={slot['x']:.2f}   y={slot['y']:.2f}"
 
-        cv2.putText(
-            frame,
-            text,
-            (bx1 + int(10 * inv), by1 + int(22 * inv)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5 * inv,
-            text_color,
-            max(1, int(1 * inv)),
-        )
+        cv2.putText(frame, text, (x1 + 9, y1 + min(21, row_height - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, text_color, 1, cv2.LINE_AA)
 
-        y += row_h
+        overlay_state["buttons"].append((i, (x1, y1, x2, y2)))
 
 def draw_scene_on_frame(
     frame,
@@ -724,3 +697,72 @@ def box_to_pixel_polygon(
         corners.append((u, v))
 
     return np.array(corners, dtype=np.int32)
+
+def draw_aruco_debug(frame, detected, H_world_to_image=None):
+    for marker_id, corners in detected.items():
+        pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+        pts_i = np.round(pts).astype(np.int32)
+
+        cv2.polylines(frame, [pts_i], True, (255, 0, 255), 2)
+
+        center = pts.mean(axis=0)
+        cx, cy = int(center[0]), int(center[1])
+
+        cv2.circle(frame, (cx, cy), 4, (255, 0, 255), -1)
+        cv2.putText(frame, f"ArUco {marker_id}", (cx + 6, cy - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 2)
+
+        left = (pts[0] + pts[3]) / 2
+        right = (pts[1] + pts[2]) / 2
+        top = (pts[0] + pts[1]) / 2
+        bottom = (pts[2] + pts[3]) / 2
+
+        x_dir = right - left
+        y_dir = bottom - top
+
+        x_norm = np.linalg.norm(x_dir)
+        y_norm = np.linalg.norm(y_dir)
+
+        if x_norm > 1e-6:
+            x_dir /= x_norm
+        if y_norm > 1e-6:
+            y_dir /= y_norm
+
+        axis_len = max(20.0, min(x_norm, y_norm) * 0.8)
+
+        px = tuple(np.round(center + x_dir * axis_len).astype(int))
+        py = tuple(np.round(center + y_dir * axis_len).astype(int))
+
+        cv2.arrowedLine(frame, (cx, cy), px, (0, 0, 255), 2, tipLength=0.25)
+        cv2.arrowedLine(frame, (cx, cy), py, (0, 255, 0), 2, tipLength=0.25)
+
+        cv2.putText(frame, "X", (px[0] + 3, px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        cv2.putText(frame, "Y", (py[0] + 3, py[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+    if H_world_to_image is not None:
+        draw_world_axes(frame, H_world_to_image, (0.0, 0.0), axis_len=0.25, label="MAT")
+
+def project_point(H_world_to_image, x, y):
+    p = np.array([x, y, 1.0], dtype=np.float32)
+    q = H_world_to_image @ p
+    if abs(q[2]) < 1e-9:
+        return None
+    return int(q[0] / q[2]), int(q[1] / q[2])
+
+def draw_world_axes(frame, H_world_to_image, origin_xy, axis_len=0.12, label=None):
+    ox, oy = origin_xy
+
+    p0 = project_point(H_world_to_image, ox, oy)
+    px = project_point(H_world_to_image, ox + axis_len, oy)
+    py = project_point(H_world_to_image, ox, oy + axis_len)
+
+    if p0 is None or px is None or py is None:
+        return
+
+    cv2.arrowedLine(frame, p0, px, (0, 0, 255), 2, tipLength=0.2)   # X = rot
+    cv2.arrowedLine(frame, p0, py, (0, 255, 0), 2, tipLength=0.2)   # Y = grün
+    cv2.circle(frame, p0, 3, (255, 255, 0), -1)
+
+    if label is not None:
+        cv2.putText(frame, str(label), (p0[0] + 5, p0[1] - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)

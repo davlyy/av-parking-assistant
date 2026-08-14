@@ -8,16 +8,19 @@ from collections import deque
 
 from inference_sdk import InferenceConfiguration, InferenceHTTPClient
 from dotenv import load_dotenv
+from mod.draw import draw_aruco_debug
 
 load_dotenv()
 
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = "parking-lot-npjkj/2"
-YOLO_MODEL_PATH = "besttoy.pt"
+YOLO_MODEL_PATH = "best.pt"
 DEBUG = False
-ARUCO_UPDATE_INTERVAL = 5
+ARUCO_UPDATE_INTERVAL = 2
 YOLO_IMGSZ = 640
+PARKING_MAT_WIDTH_M = 1.80
+PARKING_MAT_HEIGHT_M = 1.20
 
 _cached_parking_mat_corners = None
 _cached_input_calibration = None
@@ -28,6 +31,36 @@ _ego_last = None
 _ego_velocity = np.zeros(2, dtype=np.float32)
 _ego_missing_frames = 0
 _ego_reacquire_votes = deque(maxlen=5)
+_cached_aruco_markers = {}
+PARKING_SLOT_LEFT_X = 0.25
+PARKING_SLOT_RIGHT_X = 1.55
+PARKING_SLOT_START_Y = 0.09
+PARKING_SLOT_Y_STEP = 0.17
+PARKING_SLOT_LENGTH = 0.62
+PARKING_SLOT_WIDTH = 0.15
+PARKING_SLOT_COUNT_PER_SIDE = 7
+
+PARKING_SLOTS = [
+    {
+        "id": i,
+        "x": PARKING_SLOT_LEFT_X,
+        "y": PARKING_SLOT_START_Y + i * PARKING_SLOT_Y_STEP,
+        "yaw": np.pi,
+        "length": PARKING_SLOT_LENGTH,
+        "width": PARKING_SLOT_WIDTH,
+    }
+    for i in range(PARKING_SLOT_COUNT_PER_SIDE)
+] + [
+    {
+        "id": i + PARKING_SLOT_COUNT_PER_SIDE,
+        "x": PARKING_SLOT_RIGHT_X,
+        "y": PARKING_SLOT_START_Y + i * PARKING_SLOT_Y_STEP,
+        "yaw": 0.0,
+        "length": PARKING_SLOT_LENGTH,
+        "width": PARKING_SLOT_WIDTH,
+    }
+    for i in range(PARKING_SLOT_COUNT_PER_SIDE)
+]
 
 def debug_print(*args, **kwargs):
     if DEBUG:
@@ -51,6 +84,65 @@ roboflow_client = InferenceHTTPClient(
     api_url="https://serverless.roboflow.com",
     api_key=ROBOFLOW_API_KEY
 )
+
+def image_to_world(x, y, H):
+    p = np.array([x, y, 1.0], dtype=np.float64)
+    q = H @ p
+    return float(q[0] / q[2]), float(q[1] / q[2])
+
+def world_to_image(x, y, H):
+    p = np.array([x, y, 1.0], dtype=np.float64)
+    q = H @ p
+    return float(q[0] / q[2]), float(q[1] / q[2])
+
+def detection_to_world(pred, H):
+    x, y = image_to_world(pred["x"], pred["y"], H)
+
+    x1, y1, x2, y2 = pred["bbox_px"]
+    lx, ly = image_to_world(x1, pred["y"], H)
+    rx, ry = image_to_world(x2, pred["y"], H)
+    tx, ty = image_to_world(pred["x"], y1, H)
+    bx, by = image_to_world(pred["x"], y2, H)
+
+    size_x = np.hypot(rx - lx, ry - ly)
+    size_y = np.hypot(bx - tx, by - ty)
+
+    return {
+        **pred,
+        "world_x": x,
+        "world_y": y,
+        "world_length": max(size_x, size_y),
+        "world_width": min(size_x, size_y),
+    }
+
+def assign_occupancy_to_slots(cars, H_image_to_world):
+    car_positions = []
+
+    for car in cars:
+        x, y = image_to_world(car["x"], car["y"], H_image_to_world)
+        car_positions.append((x, y))
+
+    slots = []
+
+    for slot in PARKING_SLOTS:
+        yaw = float(slot["yaw"])
+        c, s = np.cos(yaw), np.sin(yaw)
+        occupied = False
+
+        for car_x, car_y in car_positions:
+            dx = car_x - slot["x"]
+            dy = car_y - slot["y"]
+
+            local_x = c * dx + s * dy
+            local_y = -s * dx + c * dy
+
+            if abs(local_x) <= slot["length"] / 2 and abs(local_y) <= slot["width"] / 2:
+                occupied = True
+                break
+
+        slots.append({**slot, "free": not occupied})
+
+    return slots
 
 #Calibration
 def calibrate_from_ego(ego: dict) -> float:
@@ -134,6 +226,83 @@ def _order_quad_points(points):
     ordered[3] = points[np.argmax(diffs)]
     return ordered
 
+def build_parking_mat_homography(corners):
+    image_points = np.asarray(corners, dtype=np.float32)
+    world_points = np.array([
+        [0.0, 0.0],
+        [PARKING_MAT_WIDTH_M, 0.0],
+        [PARKING_MAT_WIDTH_M, PARKING_MAT_HEIGHT_M],
+        [0.0, PARKING_MAT_HEIGHT_M],
+    ], dtype=np.float32)
+
+    H_image_to_world = cv2.getPerspectiveTransform(image_points, world_points)
+    H_world_to_image = cv2.getPerspectiveTransform(world_points, image_points)
+    return H_image_to_world, H_world_to_image
+
+def transform_points(points, H):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(points, H).reshape(-1, 2)
+
+def transform_points_affine(points, A):
+    points = np.asarray(points, dtype=np.float32)
+    return points @ A[:, :2].T + A[:, 2]
+
+def update_parking_mat_geometry(frame, detected):
+    global _cached_parking_mat_corners, _cached_aruco_markers
+
+    absolute = find_aruco_mat_corners(frame, detected)
+
+    if absolute is not None:
+        _cached_parking_mat_corners = absolute
+        _cached_aruco_markers = {marker_id: corners.copy() for marker_id, corners in detected.items()}
+        return _cached_parking_mat_corners, "absolute"
+
+    if _cached_parking_mat_corners is None:
+        return None, "waiting"
+
+    common_ids = [marker_id for marker_id in detected if marker_id in _cached_aruco_markers]
+
+    if len(common_ids) >= 2:
+        src = np.concatenate([_cached_aruco_markers[i] for i in common_ids]).astype(np.float32)
+        dst = np.concatenate([detected[i] for i in common_ids]).astype(np.float32)
+
+        H, _ = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+
+        if H is not None:
+            _cached_parking_mat_corners = transform_points(_cached_parking_mat_corners, H)
+            _cached_aruco_markers = {
+                marker_id: transform_points(corners, H)
+                for marker_id, corners in _cached_aruco_markers.items()
+            }
+
+            for marker_id, corners in detected.items():
+                _cached_aruco_markers[marker_id] = corners.copy()
+
+            return _cached_parking_mat_corners, f"tracked-{len(common_ids)}"
+
+    elif len(common_ids) == 1:
+        marker_id = common_ids[0]
+        src = _cached_aruco_markers[marker_id].astype(np.float32)
+        dst = detected[marker_id].astype(np.float32)
+
+        A, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+
+        if A is not None:
+            _cached_parking_mat_corners = transform_points_affine(_cached_parking_mat_corners, A)
+            _cached_aruco_markers = {
+                marker_id: transform_points_affine(corners, A)
+                for marker_id, corners in _cached_aruco_markers.items()
+            }
+
+            for marker_id, corners in detected.items():
+                _cached_aruco_markers[marker_id] = corners.copy()
+
+            return _cached_parking_mat_corners, "tracked-1"
+
+    for marker_id, corners in detected.items():
+        _cached_aruco_markers[marker_id] = corners.copy()
+
+    return _cached_parking_mat_corners, "cached"
 
 def detect_aruco_markers(frame):
     """Detect expected ArUco markers, keyed by their IDs."""
@@ -747,102 +916,61 @@ def filter_slots_by_median_area(avail, tolerance=0.30):
     return filtered
 
 #[Stage 5]: Build A* JSON Payload
-def build_astar_payload(ego, obstacles, avail, frame_id=0, image_width=None,
-                        image_height=None, parking_mat_corners=None,
-                        input_calibration=None):
-    """
-    Converts pixel-space detections to metric A* payload.
-    Target slot = available slot closest to ego vehicle.
-    """
-    if ego is None or not avail:
-        print("[Warn] Cannot build payload: missing ego or available slots")
+def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, image_width=None, image_height=None, parking_mat_corners=None, input_calibration=None):
+    available = [slot for slot in slots if slot["free"]]
+
+    if ego is None or not available:
+        debug_print("[Warn] Cannot build payload: missing ego or available slots")
         return None
 
-    # The first entry remains the A* goal; retain every other free-space
-    # detection for callers that want to choose an alternative goal.
-    ordered_slots = sorted(avail, key=lambda s: dist(s, ego))
-    target_slot = ordered_slots[0]
-
-    def slot_to_payload(slot):
-        slot_x, slot_y = px_to_metric(slot['x'], slot['y'])
-        slot_w, slot_h = size_to_metric(slot['width'], slot['height'])
-        return {
-            "x":      slot_x,
-            "y":      slot_y,
-            "yaw":    estimate_yaw(slot),
-            "length": round(max(slot_w, slot_h), 3),
-            "width":  round(min(slot_w, slot_h), 3)
-        }
-
-    ego_x,  ego_y  = px_to_metric(ego['x'], ego['y'])
-    goal_x, goal_y = px_to_metric(target_slot['x'], target_slot['y'])
-
-    image_width = image_width if image_width is not None else 0
-    image_height = image_height if image_height is not None else 0
-    # World coordinates in this payload are metres derived from x_px / ppm and
-    # y_px / ppm. This is the corresponding metric-to-image homography for the
-    # current cropped image coordinate system.
-    world_to_image = [
-        [round(PIXELS_PER_METER, 6), 0.0, 0.0],
-        [0.0, round(PIXELS_PER_METER, 6), 0.0],
-        [0.0, 0.0, 1.0],
-    ]
+    available = sorted(available, key=lambda s: np.hypot(s["x"] - ego["world_x"], s["y"] - ego["world_y"]))
+    target = available[0]
 
     payload = {
         "frame_id": frame_id,
-        "image_width": image_width,
-        "image_height": image_height,
+        "image_width": image_width or 0,
+        "image_height": image_height or 0,
         "parking_mat_bounds": {
             "coordinate_space": "image_pixels",
             "corners": [
-                {"name": name, "x": round(float(point[0]), 2), "y": round(float(point[1]), 2)}
-                for name, point in zip(
-                    ("top_left", "top_right", "bottom_right", "bottom_left"),
-                    parking_mat_corners,
-                )
+                {"name": name, "x": round(float(p[0]), 2), "y": round(float(p[1]), 2)}
+                for name, p in zip(("top_left", "top_right", "bottom_right", "bottom_left"), parking_mat_corners)
             ],
         } if parking_mat_corners is not None else None,
         "input_calibration": input_calibration,
         "projection": {
             "type": "homography",
-            "H_world_to_image": world_to_image,
+            "H_world_to_image": H_world_to_image.tolist(),
         },
         "start_pose": {
-            "x":   ego_x,
-            "y":   ego_y,
-            "yaw": estimate_yaw(ego)
+            "x": round(ego["world_x"], 3),
+            "y": round(ego["world_y"], 3),
+            "yaw": estimate_yaw(ego),
         },
         "goal_pose": {
-            "x":   goal_x,
-            "y":   goal_y,
-            "yaw": estimate_yaw(target_slot)
+            "x": target["x"],
+            "y": target["y"],
+            "yaw": target["yaw"],
         },
         "obstacles": [
             {
-                "x":      round(o['x'] / PIXELS_PER_METER, 3),
-                "y":      round(o['y'] / PIXELS_PER_METER, 3),
-                "length": round(max(o['width'], o['height']) / PIXELS_PER_METER, 3),
-                "width":  round(min(o['width'], o['height']) / PIXELS_PER_METER, 3),
-                "yaw":    estimate_yaw(o)
+                "x": round(o["world_x"], 3),
+                "y": round(o["world_y"], 3),
+                "length": round(o["world_length"], 3),
+                "width": round(o["world_width"], 3),
+                "yaw": estimate_yaw(o),
             }
             for o in obstacles
         ],
-        "parking_slot": {
-            "x":      goal_x,
-            "y":      goal_y,
-            "yaw":    estimate_yaw(target_slot),
-            "length": slot_to_payload(target_slot)["length"],
-            "width":  slot_to_payload(target_slot)["width"]
-        },
-        "available_parking_slots": [
-            slot_to_payload(slot) for slot in ordered_slots
-        ],
-        "vehicle": VEHICLE_SPEC
+        "parking_slot": target.copy(),
+        "parking_slots": [slot.copy() for slot in slots],
+        "available_parking_slots": [slot.copy() for slot in available],
+        "vehicle": VEHICLE_SPEC,
     }
 
     if DEBUG:
-        print("\nA* Payload")
         print(json.dumps(payload, indent=2))
+
     return payload
 
 #Visualization
@@ -937,11 +1065,8 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
     return vis
 
 
-def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
-                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.5,
-                  aruco_marker_size_mm=None, visualize=True):
-    global PIXELS_PER_METER
-    global _cached_parking_mat_corners, _cached_input_calibration
+def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow", yolo_model_path=YOLO_MODEL_PATH, confidence=0.5, aruco_marker_size_mm=None, visualize=True):
+    global _cached_parking_mat_corners, _cached_input_calibration, _cached_aruco_markers
 
     update_aruco = (
         _cached_parking_mat_corners is None
@@ -949,60 +1074,49 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
         or frame_id % ARUCO_UPDATE_INTERVAL == 0
     )
 
+    detected = detect_aruco_markers(frame)
+
     if update_aruco:
-        detected = detect_aruco_markers(frame)
-
-        new_corners = find_parking_mat_bounds(frame, detected)
-        new_calibration = calibrate_input_from_aruco(
-            frame,
-            aruco_marker_size_mm,
-            detected,
-        )
-
-        if new_corners is not None:
-            _cached_parking_mat_corners = new_corners
+        parking_mat_corners, aruco_mode = update_parking_mat_geometry(frame, detected)
+        new_calibration = calibrate_input_from_aruco(frame, aruco_marker_size_mm, detected)
 
         if new_calibration is not None:
             _cached_input_calibration = new_calibration
 
-    parking_mat_corners = _cached_parking_mat_corners
+        debug_print(f"[ArUco] markers={sorted(detected)} mode={aruco_mode}")
+    else:
+        parking_mat_corners = _cached_parking_mat_corners
+
     input_calibration = _cached_input_calibration
 
-    cars, avail, raw_preds = run_vehicle_detector(
-        frame,
-        detector,
-        yolo_model_path,
-        confidence,
-    )
-
+    cars, avail, raw_preds = run_vehicle_detector(frame, detector, yolo_model_path, confidence)
     ego = select_ego(cars, frame)
     ego_track_id = ego.get("track_id") if ego else None
-
-    obstacles = [
-        car for car in cars
-        if car.get("track_id") != ego_track_id
-    ]
+    obstacles = [car for car in cars if car.get("track_id") != ego_track_id]
 
     avail = filter_slots_by_median_area(avail)
     avail = remove_slots_containing_ego(avail, ego)
 
+    if parking_mat_corners is None:
+        result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
+        return result, None
+
+    H_image_to_world, H_world_to_image = build_parking_mat_homography(parking_mat_corners)
+
+    if ego is not None:
+        ego = detection_to_world(ego, H_image_to_world)
+
+    obstacles = [detection_to_world(o, H_image_to_world) for o in obstacles]
+    slots = assign_occupancy_to_slots(cars, H_image_to_world)
+
     debug_print(
         f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
-        f"Obstacles: {len(obstacles)} | Available: {len(avail)}"
+        f"Obstacles: {len(obstacles)} | "
+        f"Available: {sum(slot['free'] for slot in slots)}"
     )
 
-    if PIXELS_PER_METER is None:
-        if ego is not None and not ego.get("tracked_only", False):
-            PIXELS_PER_METER = calibrate_from_ego(ego)
-        else:
-            debug_print("Waiting for reliable ego detection before calibration")
-            result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
-            return result, None
-
     payload = build_astar_payload(
-        ego,
-        obstacles,
-        avail,
+        ego, obstacles, slots, H_world_to_image,
         frame_id=frame_id,
         image_width=frame.shape[1],
         image_height=frame.shape[0],
@@ -1011,6 +1125,10 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
     )
 
     result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
+
+    if result is not None:
+        draw_parking_slots(result, slots, H_world_to_image)
+        draw_aruco_debug(result, _cached_aruco_markers, H_world_to_image)
 
     if debug_dir and result is not None:
         _save_debug_image(debug_dir, "stage_5_final.png", result)
@@ -1188,3 +1306,43 @@ if __name__ == "__main__":
         with open(args.payload, 'w') as f:
             json.dump(payload, f, indent=2)
         print(f"A* payload saved to: {args.payload}")
+
+def parking_slots_with_image_positions(H_world_to_image):
+    result = []
+
+    for slot in PARKING_SLOTS:
+        u, v = world_to_image(slot["x"], slot["y"], H_world_to_image)
+        result.append({
+            **slot,
+            "image_x": u,
+            "image_y": v,
+        })
+
+    return result
+
+def draw_parking_slots(img, slots, H_world_to_image):
+    for slot in slots:
+        cx, cy = float(slot["x"]), float(slot["y"])
+        yaw = float(slot.get("yaw", 0.0))
+        half_l = float(slot["length"]) / 2
+        half_w = float(slot["width"]) / 2
+        c, s = np.cos(yaw), np.sin(yaw)
+
+        points = []
+        for lx, ly in [(half_l, half_w), (half_l, -half_w), (-half_l, -half_w), (-half_l, half_w)]:
+            x = cx + c * lx - s * ly
+            y = cy + s * lx + c * ly
+            u, v = world_to_image(x, y, H_world_to_image)
+            points.append([int(round(u)), int(round(v))])
+
+        points = np.array(points, dtype=np.int32)
+        free = slot.get("free", False)
+        color = (0, 255, 0) if free else (0, 255, 255)
+        label = f"P{slot['id']} FREE" if free else f"P{slot['id']}"
+
+        cv2.polylines(img, [points], True, color, 2)
+        u, v = world_to_image(cx, cy, H_world_to_image)
+        cv2.circle(img, (int(u), int(v)), 4, color, -1)
+        cv2.putText(img, label, (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+
+    return img
