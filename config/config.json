@@ -1,11 +1,7 @@
 {
-  "source_type": "video",
-  "video": {
-    "path": "Video3.mp4",
-    "loop": true
-  },
+  "source_type": "camera",
   "Camera": {
-    "device_id": 0,
+    "device_id": 2,
     "width": 1280,
     "height": 720,
     "fps": 30,

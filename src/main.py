@@ -6,17 +6,19 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+import dataclasses
+import os
 
 import cv2
 
-from frame_analyze import process_frame, YOLO_MODEL_PATH
-from input import load_config, CameraSource, ImageSource, VideoSource, SourceConfig
+from input import load_config, CameraSource, CarlaSource, ImageSource, VideoSource, SourceConfig
 from mod.path_planning import plan_path
 from mod.draw import (
     draw_scene_on_frame, draw_slot_overlay, draw_path_to_goal_on_frame,
     get_parking_slots, make_projector, make_slot_overlay_mouse_callback,
     set_goal_from_slot, resize_for_display, draw_drivable_area_on_frame,
     compose_frame_with_side_panel,
+    draw_debug_measurements_on_frame,
 )
 
 PATH_PREPLAN_DEVIATION = 0.03
@@ -42,12 +44,84 @@ UI_PANEL_GAP = 10
 DISPLAY_MAX_W = 1600
 DISPLAY_MAX_H = 950
 
+try:
+    from frame_analyze import process_frame, YOLO_MODEL_PATH
+except Exception:
+    process_frame = None
+    YOLO_MODEL_PATH = "besttoy.pt"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_model_path(model_name: str = YOLO_MODEL_PATH) -> str:
+    candidates = [
+        Path(os.environ.get("BESTTOY_MODEL_PATH", "")) if os.environ.get("BESTTOY_MODEL_PATH") else None,
+        PROJECT_ROOT / model_name,
+        PROJECT_ROOT / "src" / model_name,
+        Path.cwd() / model_name,
+        Path(model_name),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if candidate.is_file():
+            return str(candidate)
+    return str(PROJECT_ROOT / model_name)
+
+
+def resolve_source_config(config: SourceConfig, source_override: str | None) -> SourceConfig:
+    if source_override is None:
+        return config
+    return dataclasses.replace(config, source_type=source_override)
+
 
 def create_source(config: SourceConfig):
-    if config.source_type == "camera": return CameraSource(config.camera)
-    if config.source_type == "image": return ImageSource(config.image)
-    if config.source_type == "video": return VideoSource(config.video)
+    if config.source_type == "carla":
+        if config.carla is None:
+            raise ValueError("CARLA config missing")
+        return CarlaSource(config.carla)
+    if config.source_type == "camera":
+        if config.camera is None:
+            raise ValueError("Camera config missing")
+        return CameraSource(config.camera)
+    if config.source_type == "image":
+        if config.image is None:
+            raise ValueError("Image config missing")
+        return ImageSource(config.image)
+    if config.source_type == "video":
+        if config.video is None:
+            raise ValueError("Video config missing")
+        return VideoSource(config.video)
     raise ValueError(f"Unknown source_type: {config.source_type}")
+
+
+def _draw_coords(frame, source) -> None:
+    if isinstance(source, CarlaSource):
+        x, y, z, yaw = source.vehicle_pose()
+        for i, line in enumerate((f"X: {x:.1f}", f"Y: {y:.1f}", f"Z: {z:.1f}", f"Yaw: {yaw:.1f}")):
+            cv2.putText(frame, line, (10, 30 + i * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+
+def run_carla(source, config: SourceConfig) -> None:
+    source.open()
+    try:
+        if config.carla and config.carla.manual:
+            for frame in source:
+                if frame is None:
+                    break
+            return
+
+        for frame in source:
+            if frame is None:
+                break
+            display = ensure_bgr(frame)
+            _draw_coords(display, source)
+            cv2.imshow("Input - carla", display)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
+    finally:
+        source.release()
+        cv2.destroyAllWindows()
 
 
 def ensure_bgr(frame):
@@ -176,6 +250,9 @@ def build_display_canvas(display_frame, slots, selected_slot_index, overlay_stat
 
 
 def run(source, config: SourceConfig) -> None:
+    if process_frame is None:
+        raise RuntimeError("frame_analyze could not be imported; the dev perception/planning pipeline is unavailable")
+
     source.open()
 
     selected_slot_index = 0
@@ -218,6 +295,7 @@ def run(source, config: SourceConfig) -> None:
     frame_id = 0
 
     try:
+
         for frame in source:
             t_frame = time.perf_counter()
             frame = ensure_bgr(frame)
@@ -228,7 +306,7 @@ def run(source, config: SourceConfig) -> None:
                 frame,
                 frame_id=frame_id,
                 detector="yolo",
-                yolo_model_path=YOLO_MODEL_PATH,
+                yolo_model_path=resolve_model_path(),
                 confidence=0.2,
                 aruco_marker_size_mm=0.98 * 24,
                 visualize=True,
@@ -335,52 +413,30 @@ def run(source, config: SourceConfig) -> None:
                             f"[Candidate stale] frame={planned_frame} "
                             f"planned_slot={candidate_slot_id} current_slot={selected_slot_id}"
                         )
-                        if candidate_slot_id != selected_slot_id:
-                            planner_discarded += 1
+                    else:
+                        valid, candidate_index = candidate_is_valid(
+                            candidate_path,
+                            candidate_payload,
+                            selected_slot,
+                            current_pose,
+                            obstacles,
+                        )
+
+                        if valid:
+                            active_path = candidate_path
+                            active_path_index = candidate_index
+                            active_planning_payload = candidate_payload
+                            planned_goal = candidate_payload["goal_pose"].copy()
                             print(
-                                f"[Candidate stale] frame={planned_frame} "
-                                f"planned_slot={candidate_slot_id} current_slot={selected_slot_id}"
+                                f"[Candidate accepted] frame={planned_frame} "
+                                f"reason={reason} time={planner_time * 1000:.1f} ms"
                             )
                         else:
-                            valid, candidate_index = candidate_is_valid(
-                                candidate_path,
-                                candidate_payload,
-                                selected_slot,
-                                current_pose,
-                                obstacles,
+                            planner_discarded += 1
+                            print(
+                                f"[Candidate discarded] frame={planned_frame} "
+                                f"reason={reason} time={planner_time * 1000:.1f} ms"
                             )
-
-                            if valid:
-                                active_path = candidate_path
-                                active_path_index = candidate_index
-                                active_planning_payload = candidate_payload
-                                planned_goal = candidate_payload["goal_pose"].copy()
-                                print(
-                                    f"[Candidate accepted] frame={planned_frame} reason={reason} time={planner_time * 1000:.1f} ms")
-                            else:
-                                planner_discarded += 1
-                                print(
-                                    f"[Candidate discarded] frame={planned_frame} reason={reason} time={planner_time * 1000:.1f} ms")
-
-                        planner_future = None
-
-                    valid, candidate_index = candidate_is_valid(
-                        candidate_path,
-                        candidate_payload,
-                        selected_slot,
-                        current_pose,
-                        obstacles,
-                    )
-
-                    if valid:
-                        active_path = candidate_path
-                        active_path_index = candidate_index
-                        active_planning_payload = candidate_payload
-                        planned_goal = candidate_payload["goal_pose"].copy()
-                        print(f"[Candidate accepted] frame={planned_frame} reason={reason} time={planner_time * 1000:.1f} ms")
-                    else:
-                        planner_discarded += 1
-                        print(f"[Candidate discarded] frame={planned_frame} reason={reason} time={planner_time * 1000:.1f} ms")
 
                 except Exception as error:
                     planner_calls += 1
@@ -478,7 +534,7 @@ def run(source, config: SourceConfig) -> None:
                 project,
                 overlay_state,
             )
-
+            draw_debug_measurements_on_frame(display_frame, planning_payload_current, selected_slot_index)
             display_path = trim_path_for_display(active_path, current_pose, active_path_index)
 
             if display_path and active_planning_payload is not None:
@@ -534,6 +590,7 @@ def run(source, config: SourceConfig) -> None:
                     f"planner/call: {planner_avg:.1f} ms"
                 )
 
+
     finally:
         if planner_future is not None:
             planner_future.cancel()
@@ -569,12 +626,44 @@ def run(source, config: SourceConfig) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=str(Path(__file__).resolve().parent.parent / "config" / "config.json"))
+
+    parser = argparse.ArgumentParser(description="AV Parking Assistant")
+    parser.add_argument(
+        "--source",
+        choices=["camera", "carla"],
+        default=None,
+        help="Override the input source configured in the JSON file",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(PROJECT_ROOT / "config" / "config.json"),
+        help="Path to JSON config file",
+    )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default="scenario_1",
+        help="Named scenario preset from config",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    run(create_source(config), config)
+    config = resolve_source_config(config, args.source)
+
+    if args.scenario and config.carla and args.scenario in config.carla.scenarios:
+        preset = config.carla.scenarios[args.scenario]
+        config = dataclasses.replace(
+            config,
+            carla=dataclasses.replace(config.carla, scenario=preset, scenario_name=args.scenario),
+        )
+
+    source = create_source(config)
+    if config.source_type == "carla":
+        run_carla(source, config)
+    else:
+        run(source, config)
+
 
 
 if __name__ == "__main__":

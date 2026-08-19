@@ -14,7 +14,7 @@ load_dotenv()
 
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
-ROBOFLOW_MODEL_ID = "parking-lot-npjkj/2"
+ROBOFLOW_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "parking-lot-npjkj/2")
 YOLO_MODEL_PATH = "best.pt"
 DEBUG = False
 ARUCO_UPDATE_INTERVAL = 2
@@ -26,6 +26,7 @@ _cached_parking_mat_corners = None
 _cached_input_calibration = None
 _yolo_model = None
 _yolo_model_path = None
+_ego_size_history = deque(maxlen=20)
 _ego_track_id = None
 _ego_last = None
 _ego_velocity = np.zeros(2, dtype=np.float32)
@@ -35,17 +36,27 @@ _cached_aruco_markers = {}
 PARKING_SLOT_LEFT_X = 0.25
 PARKING_SLOT_RIGHT_X = 1.55
 PARKING_SLOT_START_Y = 0.09
-PARKING_SLOT_Y_STEP = 0.17
-PARKING_SLOT_LENGTH = 0.62
-PARKING_SLOT_WIDTH = 0.15
-PARKING_SLOT_COUNT_PER_SIDE = 7
+PARKING_SLOT_Y_STEP = 0.1465
+#PARKING_SLOT_LENGTH = 0.60
+#PARKING_SLOT_WIDTH = PARKING_SLOT_Y_STEP
+PARKING_SLOT_COUNT_PER_SIDE = 8
+
+
+PARKING_SLOT_X_STEP = PARKING_MAT_WIDTH_M / PARKING_SLOT_COUNT_PER_SIDE
+PARKING_SLOT_START_X = PARKING_SLOT_X_STEP / 2
+
+PARKING_SLOT_TOP_Y = 0.20
+PARKING_SLOT_BOTTOM_Y = PARKING_MAT_HEIGHT_M - 0.20
+
+PARKING_SLOT_LENGTH = 0.50
+PARKING_SLOT_WIDTH = PARKING_SLOT_X_STEP
 
 PARKING_SLOTS = [
     {
         "id": i,
-        "x": PARKING_SLOT_LEFT_X,
-        "y": PARKING_SLOT_START_Y + i * PARKING_SLOT_Y_STEP,
-        "yaw": np.pi,
+        "x": PARKING_SLOT_START_X + i * PARKING_SLOT_X_STEP,
+        "y": PARKING_SLOT_TOP_Y,
+        "yaw": np.pi / 2,
         "length": PARKING_SLOT_LENGTH,
         "width": PARKING_SLOT_WIDTH,
     }
@@ -53,9 +64,9 @@ PARKING_SLOTS = [
 ] + [
     {
         "id": i + PARKING_SLOT_COUNT_PER_SIDE,
-        "x": PARKING_SLOT_RIGHT_X,
-        "y": PARKING_SLOT_START_Y + i * PARKING_SLOT_Y_STEP,
-        "yaw": 0.0,
+        "x": PARKING_SLOT_START_X + i * PARKING_SLOT_X_STEP,
+        "y": PARKING_SLOT_BOTTOM_Y,
+        "yaw": -np.pi / 2,
         "length": PARKING_SLOT_LENGTH,
         "width": PARKING_SLOT_WIDTH,
     }
@@ -66,12 +77,21 @@ def debug_print(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
+
+def get_roboflow_client():
+    if not ROBOFLOW_API_KEY:
+        return None
+    return InferenceHTTPClient(
+        api_url="https://serverless.roboflow.com",
+        api_key=ROBOFLOW_API_KEY,
+    )
+
 # Vehicle spec (Lincoln MKZ 2017) — ground truth for calibration
 VEHICLE_SPEC = {
-    "wheelbase":  2.850,
-    "length":     4.980,   # meters
-    "width":      1.900,   # meters
-    "max_steer":  0.44157
+    "wheelbase": 0.12,
+    "length": 0.20,
+    "width": 0.09,
+    "max_steer": 0.44157,
 }
 
 # Runtime calibration
@@ -79,11 +99,8 @@ VEHICLE_SPEC = {
 # Two independent ratios (length and width axis) are averaged for robustness
 PIXELS_PER_METER: float = None  # set by calibrate_from_ego()
 
-#Roboflow Client
-roboflow_client = InferenceHTTPClient(
-    api_url="https://serverless.roboflow.com",
-    api_key=ROBOFLOW_API_KEY
-)
+#Roboflow Client (lazy, only needed for the Roboflow detector)
+roboflow_client = get_roboflow_client()
 
 def image_to_world(x, y, H):
     p = np.array([x, y, 1.0], dtype=np.float64)
@@ -649,6 +666,12 @@ def detect_vehicles(frame):
         avail      – list of available slot predictions
         raw_preds  – all predictions (for visualization)
     """
+    if roboflow_client is None:
+        raise RuntimeError(
+            "Roboflow detection selected but ROBOFLOW_API_KEY is not configured. "
+            "Use the local YOLO detector instead or set ROBOFLOW_API_KEY."
+        )
+
     api_result = roboflow_client.infer(frame, model_id=ROBOFLOW_MODEL_ID)
 
     # api_result is a dict with key 'predictions'
@@ -930,6 +953,13 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
         "frame_id": frame_id,
         "image_width": image_width or 0,
         "image_height": image_height or 0,
+        "drivable_area": {
+            "type": "image_polygon",
+            "points": [
+                [float(p[0]), float(p[1])]
+                for p in parking_mat_corners
+            ],
+        } if parking_mat_corners is not None else None,
         "parking_mat_bounds": {
             "coordinate_space": "image_pixels",
             "corners": [
@@ -965,7 +995,7 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
         "parking_slot": target.copy(),
         "parking_slots": [slot.copy() for slot in slots],
         "available_parking_slots": [slot.copy() for slot in available],
-        "vehicle": VEHICLE_SPEC,
+        "vehicle": get_estimated_vehicle_spec(),
     }
 
     if DEBUG:
@@ -1063,9 +1093,26 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
         cv2.putText(vis, label, (x1, max(15, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return vis
+def get_estimated_vehicle_spec():
+    if not _ego_size_history:
+        return VEHICLE_SPEC.copy()
 
+    lengths = [v[0] for v in _ego_size_history]
+    widths = [v[1] for v in _ego_size_history]
 
-def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow", yolo_model_path=YOLO_MODEL_PATH, confidence=0.5, aruco_marker_size_mm=None, visualize=True):
+    length = float(np.median(lengths))
+    width = float(np.median(widths))
+
+    return {
+        "wheelbase": VEHICLE_SPEC["wheelbase"],
+        "length": length,
+        "width": width,
+        "max_steer": VEHICLE_SPEC["max_steer"],
+    }
+
+def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
+                  yolo_model_path=YOLO_MODEL_PATH, confidence=0.5,
+                  aruco_marker_size_mm=None, visualize=True):
     global _cached_parking_mat_corners, _cached_input_calibration, _cached_aruco_markers
 
     update_aruco = (
@@ -1105,6 +1152,11 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow", yolo_m
 
     if ego is not None:
         ego = detection_to_world(ego, H_image_to_world)
+        if not ego.get("tracked_only", False):
+            _ego_size_history.append((
+                ego["world_length"],
+                ego["world_width"],
+            ))
 
     obstacles = [detection_to_world(o, H_image_to_world) for o in obstacles]
     slots = assign_occupancy_to_slots(cars, H_image_to_world)
@@ -1279,9 +1331,24 @@ if __name__ == "__main__":
         )
         raise SystemExit(0)
 
-    frame = cv2.imread(args.input)
-    if frame is None:
-        raise FileNotFoundError(f"Cannot read image: {args.input}")
+    camera_index = None
+    if args.input.isdigit():
+        camera_index = int(args.input)
+    elif args.input.lower() in {"camera", "webcam", "0", "1", "2"}:
+        camera_index = 0
+
+    if camera_index is not None:
+        capture = cv2.VideoCapture(camera_index)
+        if not capture.isOpened():
+            raise FileNotFoundError(f"Cannot open camera: {args.input}")
+        ok, frame = capture.read()
+        capture.release()
+        if not ok:
+            raise RuntimeError(f"Failed to read camera frame from: {args.input}")
+    else:
+        frame = cv2.imread(args.input)
+        if frame is None:
+            raise FileNotFoundError(f"Cannot read image: {args.input}")
 
     if args.test_model:
         result = test_model(

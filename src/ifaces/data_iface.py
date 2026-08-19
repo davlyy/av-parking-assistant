@@ -16,7 +16,7 @@ class Config:
     heuristic_weight = 2.5
     search_margin: float = 20.0
 
-    goal_tolerance: float = 1.2
+    goal_tolerance: float = 0.1
     planner_goal_tolerance: float = 0.45
     goal_yaw_tolerance: float = math.radians(20)
 

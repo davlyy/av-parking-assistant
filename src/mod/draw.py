@@ -11,6 +11,115 @@ ARUCO_WORLD = {
     2: {"x": 1.80, "y": 2.40},
     3: {"x": 0.00, "y": 2.40},
 }
+DEBUG_WORLD_X_MIN = 0.0
+DEBUG_WORLD_X_MAX = 1.8
+DEBUG_WORLD_Y_MIN = 0.0
+DEBUG_WORLD_Y_MAX = 1.2
+DEBUG_GRID_STEP = 0.1
+
+def _w2i(payload, pts):
+    H = np.asarray(payload["projection"]["H_world_to_image"], dtype=np.float32)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
+    img = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+    return np.round(img).astype(int)
+
+def _rot_box(x, y, length, width, yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    hl, hw = length / 2.0, width / 2.0
+    local = np.array([
+        [-hl, -hw],
+        [ hl, -hw],
+        [ hl,  hw],
+        [-hl,  hw],
+    ], dtype=np.float32)
+    R = np.array([[c, -s], [s, c]], dtype=np.float32)
+    world = local @ R.T
+    world[:, 0] += x
+    world[:, 1] += y
+    return world
+
+def _draw_text_block(frame, lines, x, y, color=(255, 255, 255), scale=0.45, thickness=1):
+    dy = int(18 * scale / 0.45)
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
+    for x in np.arange(DEBUG_WORLD_X_MIN, DEBUG_WORLD_X_MAX + 1e-6, DEBUG_GRID_STEP):
+        p0, p1 = _w2i(payload, [(x, DEBUG_WORLD_Y_MIN), (x, DEBUG_WORLD_Y_MAX)])
+        cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
+    for y in np.arange(DEBUG_WORLD_Y_MIN, DEBUG_WORLD_Y_MAX + 1e-6, DEBUG_GRID_STEP):
+        p0, p1 = _w2i(payload, [(DEBUG_WORLD_X_MIN, y), (DEBUG_WORLD_X_MAX, y)])
+        cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
+
+    if payload.get("drivable_area") and payload["drivable_area"].get("type") == "image_polygon":
+        poly = np.asarray(payload["drivable_area"]["points"], dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [poly], True, (0, 255, 0), 2, cv2.LINE_AA)
+
+    v = payload.get("vehicle", {})
+    ego = payload.get("start_pose")
+    if ego and v:
+        x, y, yaw = float(ego["x"]), float(ego["y"]), float(ego["yaw"])
+        length = float(v["length"])
+        width = float(v["width"])
+        wheelbase = float(v["wheelbase"])
+
+        box = _rot_box(x, y, length, width, yaw)
+        box_i = _w2i(payload, box).reshape(-1, 1, 2)
+        cv2.polylines(frame, [box_i], True, (0, 140, 255), 2, cv2.LINE_AA)
+
+        center = _w2i(payload, [(x, y)])[0]
+        front = _w2i(payload, [(x + 0.20 * math.cos(yaw), y + 0.20 * math.sin(yaw))])[0]
+        rear_axle = _w2i(payload, [(x - 0.5 * wheelbase * math.cos(yaw), y - 0.5 * wheelbase * math.sin(yaw))])[0]
+        front_axle = _w2i(payload, [(x + 0.5 * wheelbase * math.cos(yaw), y + 0.5 * wheelbase * math.sin(yaw))])[0]
+
+        cv2.circle(frame, tuple(center), 4, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.arrowedLine(frame, tuple(center), tuple(front), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.25)
+        cv2.line(frame, tuple(rear_axle), tuple(front_axle), (255, 255, 0), 2, cv2.LINE_AA)
+
+        tl = box_i.reshape(-1, 2).min(axis=0)
+        _draw_text_block(
+            frame,
+            [
+                f"EGO x={x:.2f} y={y:.2f}",
+                f"yaw={math.degrees(yaw):.1f} deg",
+                f"L={length:.3f} W={width:.3f} WB={wheelbase:.3f}",
+            ],
+            int(tl[0]),
+            int(tl[1]) - 38,
+            color=(0, 220, 255),
+            scale=0.45,
+        )
+
+    slots = payload.get("available_parking_slots", [])
+    for i, slot in enumerate(slots):
+        x, y, yaw = float(slot["x"]), float(slot["y"]), float(slot["yaw"])
+        length = float(slot["length"])
+        width = float(slot["width"])
+
+        box = _rot_box(x, y, length, width, yaw)
+        box_i = _w2i(payload, box).reshape(-1, 1, 2)
+
+        color = (255, 0, 0) if i == selected_slot_index else (0, 255, 255)
+        thick = 3 if i == selected_slot_index else 2
+        cv2.polylines(frame, [box_i], True, color, thick, cv2.LINE_AA)
+
+        center = _w2i(payload, [(x, y)])[0]
+        px = _w2i(payload, [(x + 0.12 * math.cos(yaw), y + 0.12 * math.sin(yaw))])[0]
+        py = _w2i(payload, [(x - 0.12 * math.sin(yaw), y + 0.12 * math.cos(yaw))])[0]
+        cv2.circle(frame, tuple(center), 3, color, -1, cv2.LINE_AA)
+        cv2.arrowedLine(frame, tuple(center), tuple(px), (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
+        cv2.arrowedLine(frame, tuple(center), tuple(py), (0, 255, 0), 1, cv2.LINE_AA, tipLength=0.3)
+
+        label_pos = box_i.reshape(-1, 2).mean(axis=0).astype(int)
+        _draw_text_block(
+            frame,
+            [f"S{i}: L={length:.3f} W={width:.3f}", f"yaw={math.degrees(yaw):.1f}"],
+            int(label_pos[0]) + 6,
+            int(label_pos[1]) - 8,
+            color=color,
+            scale=0.38,
+        )
 
 def draw_drivable_area_on_frame(frame, payload: dict) -> None:
     area = payload.get("drivable_area")
