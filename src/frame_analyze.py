@@ -12,10 +12,19 @@ load_dotenv()
 
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
-ROBOFLOW_MODEL_ID = "parking-lot-npjkj/2"
+ROBOFLOW_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "besttoy/1")
 YOLO_MODEL_PATH = "besttoy.pt"
 _yolo_model = None
 _yolo_model_path = None
+
+
+def get_roboflow_client():
+    if not ROBOFLOW_API_KEY:
+        return None
+    return InferenceHTTPClient(
+        api_url="https://serverless.roboflow.com",
+        api_key=ROBOFLOW_API_KEY,
+    )
 
 # Vehicle spec (Lincoln MKZ 2017) — ground truth for calibration
 VEHICLE_SPEC = {
@@ -30,11 +39,8 @@ VEHICLE_SPEC = {
 # Two independent ratios (length and width axis) are averaged for robustness
 PIXELS_PER_METER: float = None  # set by calibrate_from_ego()
 
-#Roboflow Client
-roboflow_client = InferenceHTTPClient(
-    api_url="https://serverless.roboflow.com",
-    api_key=ROBOFLOW_API_KEY
-)
+#Roboflow Client (lazy, only needed for the Roboflow detector)
+roboflow_client = get_roboflow_client()
 
 #Calibration
 def calibrate_from_ego(ego: dict) -> float:
@@ -470,6 +476,12 @@ def detect_vehicles(frame):
         avail      – list of available slot predictions
         raw_preds  – all predictions (for visualization)
     """
+    if roboflow_client is None:
+        raise RuntimeError(
+            "Roboflow detection selected but ROBOFLOW_API_KEY is not configured. "
+            "Use the local YOLO detector instead or set ROBOFLOW_API_KEY."
+        )
+
     api_result = roboflow_client.infer(frame, model_id=ROBOFLOW_MODEL_ID)
 
     # api_result is a dict with key 'predictions'
@@ -837,7 +849,7 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
     return vis
 
 
-def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
+def process_frame(frame, debug_dir=None, frame_id=0, detector="yolo",
                   yolo_model_path=YOLO_MODEL_PATH, confidence=0.5,
                   aruco_marker_size_mm=None):
     global PIXELS_PER_METER
@@ -1027,9 +1039,24 @@ if __name__ == "__main__":
         )
         raise SystemExit(0)
 
-    frame = cv2.imread(args.input)
-    if frame is None:
-        raise FileNotFoundError(f"Cannot read image: {args.input}")
+    camera_index = None
+    if args.input.isdigit():
+        camera_index = int(args.input)
+    elif args.input.lower() in {"camera", "webcam", "0", "1", "2"}:
+        camera_index = 0
+
+    if camera_index is not None:
+        capture = cv2.VideoCapture(camera_index)
+        if not capture.isOpened():
+            raise FileNotFoundError(f"Cannot open camera: {args.input}")
+        ok, frame = capture.read()
+        capture.release()
+        if not ok:
+            raise RuntimeError(f"Failed to read camera frame from: {args.input}")
+    else:
+        frame = cv2.imread(args.input)
+        if frame is None:
+            raise FileNotFoundError(f"Cannot read image: {args.input}")
 
     if args.test_model:
         result = test_model(

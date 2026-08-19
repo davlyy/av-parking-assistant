@@ -1,7 +1,41 @@
 from __future__ import annotations
 import argparse
+import dataclasses
+import os
+from pathlib import Path
+
 import cv2
 from input import load_config, CameraSource, CarlaSource, SourceConfig
+
+try:
+    from frame_analyze import process_frame, YOLO_MODEL_PATH
+except Exception:
+    process_frame = None
+    YOLO_MODEL_PATH = "besttoy.pt"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_model_path(model_name: str = YOLO_MODEL_PATH) -> str:
+    candidates = [
+        Path(os.environ.get("BESTTOY_MODEL_PATH", "")) if os.environ.get("BESTTOY_MODEL_PATH") else None,
+        PROJECT_ROOT / model_name,
+        PROJECT_ROOT / "src" / model_name,
+        Path.cwd() / model_name,
+        Path(model_name),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if candidate.is_file():
+            return str(candidate)
+    return str(PROJECT_ROOT / model_name)
+
+
+def resolve_source_config(config: SourceConfig, source_override: str | None) -> SourceConfig:
+    if source_override is None:
+        return config
+    return dataclasses.replace(config, source_type=source_override)
 
 
 def create_source(config: SourceConfig):
@@ -41,8 +75,23 @@ def run(source, config: SourceConfig) -> None:
             for frame in source:
                 if frame is None:
                     break
-                _draw_coords(frame, source)
-                cv2.imshow(f"Input - {config.source_type}", frame)
+
+                if process_frame is not None and config.source_type == "camera":
+                    try:
+                        result, _payload = process_frame(
+                            frame,
+                            detector="yolo",
+                            yolo_model_path=resolve_model_path(),
+                            confidence=0.2,
+                        )
+                        display = result
+                    except Exception:
+                        display = frame.copy()
+                else:
+                    display = frame.copy()
+
+                _draw_coords(display, source)
+                cv2.imshow(f"Input - {config.source_type}", display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
@@ -55,8 +104,8 @@ def main() -> None:
     parser.add_argument(
         "--source",
         choices=["camera", "carla"],
-        default="camera",
-        help="Input source type",
+        default=None,
+        help="Override the input source configured in the JSON file",
     )
     parser.add_argument(
         "--config",
@@ -73,9 +122,9 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    config = resolve_source_config(config, args.source)
 
     if args.scenario and config.carla and args.scenario in config.carla.scenarios:
-        import dataclasses
         preset = config.carla.scenarios[args.scenario]
         config = dataclasses.replace(
             config,
