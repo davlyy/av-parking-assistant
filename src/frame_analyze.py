@@ -17,10 +17,22 @@ ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "parking-lot-npjkj/2")
 YOLO_MODEL_PATH = "best.pt"
 DEBUG = False
-ARUCO_UPDATE_INTERVAL = 2
+ARUCO_UPDATE_INTERVAL = 4
 YOLO_IMGSZ = 640
 PARKING_MAT_WIDTH_M = 1.80
-PARKING_MAT_HEIGHT_M = 1.20
+PARKING_MAT_HEIGHT_M = 1.
+
+SHEET_EXTEND_LEFT = 0.6
+SHEET_EXTEND_RIGHT = 0.6
+SHEET_EXTEND_TOP = 0.15
+SHEET_EXTEND_BOTTOM = 0.30
+
+DRIVABLE_AREA_WORLD = [
+    (-SHEET_EXTEND_LEFT, -SHEET_EXTEND_TOP),
+    (PARKING_MAT_WIDTH_M + SHEET_EXTEND_RIGHT, -SHEET_EXTEND_TOP),
+    (PARKING_MAT_WIDTH_M + SHEET_EXTEND_RIGHT, PARKING_MAT_HEIGHT_M + SHEET_EXTEND_BOTTOM),
+    (-SHEET_EXTEND_LEFT, PARKING_MAT_HEIGHT_M + SHEET_EXTEND_BOTTOM),
+]
 
 _cached_parking_mat_corners = None
 _cached_input_calibration = None
@@ -45,15 +57,15 @@ PARKING_SLOT_COUNT_PER_SIDE = 8
 PARKING_SLOT_X_STEP = PARKING_MAT_WIDTH_M / PARKING_SLOT_COUNT_PER_SIDE
 PARKING_SLOT_START_X = PARKING_SLOT_X_STEP / 2
 
-PARKING_SLOT_TOP_Y = 0.20
-PARKING_SLOT_BOTTOM_Y = PARKING_MAT_HEIGHT_M - 0.20
+PARKING_SLOT_TOP_Y = 0.165
+PARKING_SLOT_BOTTOM_Y = PARKING_MAT_HEIGHT_M - 0.15
 
-PARKING_SLOT_LENGTH = 0.50
+PARKING_SLOT_LENGTH = 0.38
 PARKING_SLOT_WIDTH = PARKING_SLOT_X_STEP
 
 PARKING_SLOTS = [
     {
-        "id": i,
+        "id": 2 * i,
         "x": PARKING_SLOT_START_X + i * PARKING_SLOT_X_STEP,
         "y": PARKING_SLOT_TOP_Y,
         "yaw": np.pi / 2,
@@ -63,7 +75,7 @@ PARKING_SLOTS = [
     for i in range(PARKING_SLOT_COUNT_PER_SIDE)
 ] + [
     {
-        "id": i + PARKING_SLOT_COUNT_PER_SIDE,
+        "id": 2 * i + 1,
         "x": PARKING_SLOT_START_X + i * PARKING_SLOT_X_STEP,
         "y": PARKING_SLOT_BOTTOM_Y,
         "yaw": -np.pi / 2,
@@ -88,11 +100,14 @@ def get_roboflow_client():
 
 # Vehicle spec (Lincoln MKZ 2017) — ground truth for calibration
 VEHICLE_SPEC = {
-    "wheelbase": 0.12,
-    "length": 0.20,
-    "width": 0.09,
+    "wheelbase": 0.23,
+    "length": 0.38,
+    "width": 0.165,
     "max_steer": 0.44157,
 }
+
+def get_estimated_vehicle_spec():
+    return VEHICLE_SPEC.copy()
 
 # Runtime calibration
 # Set once from ego vehicle detection
@@ -948,6 +963,10 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
 
     available = sorted(available, key=lambda s: np.hypot(s["x"] - ego["world_x"], s["y"] - ego["world_y"]))
     target = available[0]
+    drivable_image = [
+        world_to_image(x, y, H_world_to_image)
+        for x, y in DRIVABLE_AREA_WORLD
+    ]
 
     payload = {
         "frame_id": frame_id,
@@ -955,11 +974,8 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
         "image_height": image_height or 0,
         "drivable_area": {
             "type": "image_polygon",
-            "points": [
-                [float(p[0]), float(p[1])]
-                for p in parking_mat_corners
-            ],
-        } if parking_mat_corners is not None else None,
+            "points": [[float(u), float(v)] for u, v in drivable_image],
+        },
         "parking_mat_bounds": {
             "coordinate_space": "image_pixels",
             "corners": [
@@ -999,7 +1015,8 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
     }
 
     if DEBUG:
-        print(json.dumps(payload, indent=2))
+        #print(json.dumps(payload, indent=2))
+        print(get_estimated_vehicle_spec())
 
     return payload
 
@@ -1093,22 +1110,6 @@ def _draw_ego_selection(frame, cars, ego, obstacles):
         cv2.putText(vis, label, (x1, max(15, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return vis
-def get_estimated_vehicle_spec():
-    if not _ego_size_history:
-        return VEHICLE_SPEC.copy()
-
-    lengths = [v[0] for v in _ego_size_history]
-    widths = [v[1] for v in _ego_size_history]
-
-    length = float(np.median(lengths))
-    width = float(np.median(widths))
-
-    return {
-        "wheelbase": VEHICLE_SPEC["wheelbase"],
-        "length": length,
-        "width": width,
-        "max_steer": VEHICLE_SPEC["max_steer"],
-    }
 
 def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
                   yolo_model_path=YOLO_MODEL_PATH, confidence=0.5,

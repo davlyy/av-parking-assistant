@@ -45,12 +45,12 @@ def _draw_text_block(frame, lines, x, y, color=(255, 255, 255), scale=0.45, thic
         cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
-    for x in np.arange(DEBUG_WORLD_X_MIN, DEBUG_WORLD_X_MAX + 1e-6, DEBUG_GRID_STEP):
-        p0, p1 = _w2i(payload, [(x, DEBUG_WORLD_Y_MIN), (x, DEBUG_WORLD_Y_MAX)])
-        cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
-    for y in np.arange(DEBUG_WORLD_Y_MIN, DEBUG_WORLD_Y_MAX + 1e-6, DEBUG_GRID_STEP):
-        p0, p1 = _w2i(payload, [(DEBUG_WORLD_X_MIN, y), (DEBUG_WORLD_X_MAX, y)])
-        cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
+    #for x in np.arange(DEBUG_WORLD_X_MIN, DEBUG_WORLD_X_MAX + 1e-6, DEBUG_GRID_STEP):
+    #    p0, p1 = _w2i(payload, [(x, DEBUG_WORLD_Y_MIN), (x, DEBUG_WORLD_Y_MAX)])
+    #    cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
+    #for y in np.arange(DEBUG_WORLD_Y_MIN, DEBUG_WORLD_Y_MAX + 1e-6, DEBUG_GRID_STEP):
+    #    p0, p1 = _w2i(payload, [(DEBUG_WORLD_X_MIN, y), (DEBUG_WORLD_X_MAX, y)])
+    #    cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
 
     if payload.get("drivable_area") and payload["drivable_area"].get("type") == "image_polygon":
         poly = np.asarray(payload["drivable_area"]["points"], dtype=np.int32).reshape(-1, 1, 2)
@@ -101,7 +101,7 @@ def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
         box_i = _w2i(payload, box).reshape(-1, 1, 2)
 
         color = (255, 0, 0) if i == selected_slot_index else (0, 255, 255)
-        thick = 3 if i == selected_slot_index else 2
+        thick = 2 if i == selected_slot_index else 1
         cv2.polylines(frame, [box_i], True, color, thick, cv2.LINE_AA)
 
         center = _w2i(payload, [(x, y)])[0]
@@ -123,7 +123,7 @@ def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
 
 def draw_drivable_area_on_frame(frame, payload: dict) -> None:
     area = payload.get("drivable_area")
-    print("drivable_area:", payload.get("drivable_area"))
+    #print("drivable_area:", payload.get("drivable_area"))
     if not area:
         return
 
@@ -201,12 +201,11 @@ def draw_box_on_frame(
     return pts
 
 def get_parking_slots(payload: dict) -> list[dict]:
-    if "parking_slots" in payload:
-        slots = [
-            {**slot, "id": int(slot.get("id", i))}
-            for i, slot in enumerate(payload["parking_slots"])
-        ]
-        return sorted(slots, key=lambda s: s["id"])
+    slots = payload.get("parking_slots", [])
+    return sorted(
+        [{**slot, "id": int(slot["id"])} for slot in slots],
+        key=lambda slot: slot["id"],
+    )
 
     if "available_parking_slots" in payload:
         slots = [
@@ -527,15 +526,7 @@ def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_re
 
         overlay_state["buttons"].append((i, (x1, y1, x2, y2)))
 
-def draw_scene_on_frame(
-    frame,
-    payload: dict,
-    slots: list[dict],
-    selected_slot_index: int,
-    project,
-    state: dict | None = None,
-    parked_slot_index: int | None = None,
-) -> None:
+def draw_scene_on_frame(frame, payload, slots, selected_slot_id, project, state=None, parked_slot_index=None):
     if state is not None:
         state["slot_polygons"] = []
 
@@ -552,7 +543,8 @@ def draw_scene_on_frame(
 
     # Parking slots
     for i, slot in enumerate(slots):
-        is_selected = i == selected_slot_index
+        for i, slot in enumerate(slots):
+            is_selected = slot["id"] == selected_slot_id
         is_parked = parked_slot_index == i
 
         if is_parked:
@@ -594,7 +586,7 @@ def resize_for_display(frame, max_w: int = 1400, max_h: int = 950):
 
     return resized, scale
 
-def draw_path_to_goal_on_frame(frame, path, project, goal_pose: dict, color=(0, 0, 255), thickness: int = 2, stride: int = 1) -> None:
+def draw_path_to_goal_on_frame(frame, path, project, goal_pose: dict, color=(0, 0, 255), thickness: int = 4, stride: int = 1) -> None:
     if not path:
         return
 

@@ -43,6 +43,17 @@ def plan_path(
 
     start = payload_pose_to_node(payload["start_pose"], gridmap)
     end = payload_pose_to_node(payload["goal_pose"], gridmap)
+    print(
+        "[Planner input]",
+        f"start=({start.x:.3f},{start.y:.3f},{math.degrees(start.theta):.1f}°)",
+        f"goal=({end.x:.3f},{end.y:.3f},{math.degrees(end.theta):.1f}°)",
+    )
+
+    print(
+        "[Planner collision]",
+        "start_free=", is_collision_free(gridmap, start),
+        "goal_free=", is_collision_free(gridmap, end),
+    )
 
     path = hybrid_A_star(gridmap, start, end)
 
@@ -55,7 +66,13 @@ def plan_path(
 type_checking_variable: PathPlanning = plan_path
 
 def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
-
+    closed_rejects = 0
+    collision_rejects = 0
+    corridor_rejects = 0
+    generated = 0
+    best_dist_seen = float("inf")
+    best_yaw_near_goal = float("inf")
+    best_pose_near_goal = None
     closed = set()
     open_nodes = {}
 
@@ -90,7 +107,13 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
         closed.add(current.idx)
 
         dist_to_goal = position_distance(current, end)
+        yaw_to_goal = parking_yaw_distance(current.theta, end.theta)
+
         best_dist_seen = min(best_dist_seen, dist_to_goal)
+
+        if dist_to_goal < config.planner_goal_tolerance and yaw_to_goal < best_yaw_near_goal:
+            best_yaw_near_goal = yaw_to_goal
+            best_pose_near_goal = current
 
         if iterations % 10000 == 0:
             print(
@@ -109,13 +132,18 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
             return reconstruct_path(current)
 
         for node in node_expansion(current, gridmap, end):
+            generated += 1
+
             if node.idx in closed:
+                closed_rejects += 1
                 continue
 
             if not is_collision_free(gridmap, node):
+                collision_rejects += 1
                 continue
 
             if not is_inside_search_corridor(node, start, end, margin=config.search_margin):
+                corridor_rejects += 1
                 continue
             node.g_cost = current.g_cost + transition_cost(current, node, gridmap)
             node.h_cost = heuristic_cost(node, end)
@@ -130,7 +158,12 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
     print("closed:", len(closed))
     print("open:", len(open_nodes))
     print("best_dist_seen:", best_dist_seen)
-
+    print(
+        "generated:", generated,
+        "closed_rejects:", closed_rejects,
+        "collision_rejects:", collision_rejects,
+        "corridor_rejects:", corridor_rejects,
+    )
     return None
 
 def distance_to_goal(pose: dict, goal_pose: dict) -> float:
@@ -306,13 +339,11 @@ def reconstruct_path(node):
 
     path = [chain[0]]
 
-    for node in chain[1:]:
-        segment = getattr(node, "segment_points", [])
-
-        if segment:
-            path.extend(segment)
+    for parent, child in zip(chain, chain[1:]):
+        if child.segment_points:
+            path.extend(child.segment_points)
         else:
-            path.append(node)
+            path.extend(sample_motion_segment(parent, child))
 
     return path
 
@@ -328,15 +359,20 @@ def position_distance(node: Node, end: Node) -> float:
     return math.hypot(end.x - node.x, end.y - node.y)
 
 def heuristic_cost(node: Node, end: Node) -> float:
-    return position_distance(node, end) + 1.5 * yaw_distance(node.theta, end.theta)
+    return position_distance(node, end) + 0.2 * yaw_distance(node.theta, end.theta)
 
 def yaw_distance(a: float, b: float) -> float:
     return abs(normalize_angle(a - b))
 
+def parking_yaw_distance(a: float, b: float) -> float:
+    d = yaw_distance(a, b)
+    return min(d, abs(np.pi - d))
 
 def is_goal_reached(node: Node, end: Node) -> bool:
-    position_tolerance = float(getattr(config, "planner_goal_tolerance", config.goal_tolerance))
-    return position_distance(node, end) < position_tolerance and yaw_distance(node.theta, end.theta) < config.goal_yaw_tolerance
+    return (
+        position_distance(node, end) < config.planner_goal_tolerance
+        and parking_yaw_distance(node.theta, end.theta) < config.goal_yaw_tolerance
+    )
 
 def world_to_grid(x: float, y: float, gridmap: GridMap3D) -> tuple[int, int]:
     x_idx = int(round((x - gridmap.origin_x) / gridmap.resolution))
@@ -356,7 +392,8 @@ def payload_pose_to_node(pose: dict, gridmap: GridMap3D) -> Node:
     )
 
 def make_idx(x: float, y: float, theta: float, gridmap: GridMap3D) -> tuple[int, int, int]:
-    x_idx, y_idx = world_to_grid(x, y, gridmap)
+    x_idx = int(round((x - gridmap.origin_x) / config.state_resolution))
+    y_idx = int(round((y - gridmap.origin_y) / config.state_resolution))
 
     theta_norm = normalize_angle(theta)
     theta_idx = int(np.floor((theta_norm + np.pi) / gridmap.theta_resolution))
@@ -380,6 +417,26 @@ def project_world_to_payload_image(payload: dict, x: float, y: float) -> tuple[f
 
     return float(q[0] / q[2]), float(q[1] / q[2])
 
+def sample_motion_segment(parent: Node, child: Node, spacing: float = 0.005) -> list[Node]:
+    length = float(child.motion_length)
+    count = max(1, int(np.ceil(length / spacing)))
+    points = []
+
+    for i in range(1, count + 1):
+        distance = length * i / count
+        x, y, theta = rollout_motion(parent, child.steer, child.direction, distance)
+
+        points.append(Node(
+            x=x,
+            y=y,
+            theta=theta,
+            idx=(-1, -1, -1),
+            steer=child.steer,
+            direction=child.direction,
+            motion_length=distance,
+        ))
+
+    return points
 
 def project_payload_image_to_world(payload: dict, u: float, v: float) -> tuple[float, float]:
     projection = payload.get("projection", {})
@@ -462,8 +519,8 @@ def apply_drivable_area_mask(payload: dict, gridmap: GridMap3D) -> None:
 
 def gridmap_init(payload: dict):
     global gridmap
-    margin = 5.0
-    obstacle_inflation = 0.3  # extra safety margin around obstacles in meters
+    margin = 0.05
+    obstacle_inflation = 0.015  # extra safety margin around obstacles in meters
 
     xs = [
         float(payload["start_pose"]["x"]),
@@ -557,11 +614,24 @@ def is_motion_collision_free(gridmap: GridMap3D, node: Node) -> bool:
     return True
 
 def is_collision_free(gridmap: GridMap3D, node) -> bool:
-    if not is_inside_grid(gridmap, node):
-        return False
+    c = np.cos(node.theta)
+    s = np.sin(node.theta)
 
-    x_idx, y_idx = world_to_grid(node.x, node.y, gridmap)
-    return gridmap.occupancy[y_idx, x_idx] == 0
+    radius = vehicle.width / 2 + 0.01
+    max_offset = vehicle.length / 2 - vehicle.width / 2
+
+    for offset in np.linspace(-max_offset, max_offset, 5):
+        x = node.x + offset * c
+        y = node.y + offset * s
+        x_idx, y_idx = world_to_grid(x, y, gridmap)
+
+        if not (0 <= y_idx < gridmap.distance.shape[0] and 0 <= x_idx < gridmap.distance.shape[1]):
+            return False
+
+        if gridmap.distance[y_idx, x_idx] < radius:
+            return False
+
+    return True
 
 def is_collision_free_rs_curve(gridmap: GridMap3D, rs_curve) -> bool:
     height, width = gridmap.occupancy.shape

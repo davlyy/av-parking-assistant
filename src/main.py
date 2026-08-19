@@ -543,7 +543,7 @@ def run(source, config: SourceConfig) -> None:
                     display_path,
                     project,
                     active_planning_payload["goal_pose"],
-                    thickness=2,
+                    thickness=6,
                 )
 
             canvas = build_display_canvas(

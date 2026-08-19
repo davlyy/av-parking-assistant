@@ -5,28 +5,31 @@ import numpy as np
 Box = tuple[int, int, int, int]
 Coordinate2D = tuple[int, int]
 
-@dataclass()
+@dataclass
 class Config:
-    dsize: float = 1.0
-    omega_1 = 0.5
-    omega_2 = 0.5
-    omega_3 = 5.0
-    d0 = 1.5
-    epsilon = 0.1
-    heuristic_weight = 2.5
-    search_margin: float = 20.0
+    dsize: float = 0.04
+    omega_1: float = 0.5
+    omega_2: float = 0.5
+    omega_3: float = 5.0
 
-    goal_tolerance: float = 0.1
-    planner_goal_tolerance: float = 0.45
-    goal_yaw_tolerance: float = math.radians(20)
+    d0: float = 0.08
+    epsilon: float = 0.01
 
-    near_goal_radius: float = 3.0
-    near_goal_dsize: float = 0.4
+    heuristic_weight: float = 2.0
+    search_margin: float = 2.0
+
+    goal_tolerance: float = 0.04
+    planner_goal_tolerance: float = 0.04
+    goal_yaw_tolerance: float = math.radians(12)
+
+    near_goal_radius: float = 0.20
+    near_goal_dsize: float = 0.03
 
     max_iterations: int = 200000
-    omega_steer_angle: float = 2.0
-    omega_reverse: float = 0.0
-    omega_direction_change: float = 1.5
+    omega_steer_angle: float = 0.5
+    omega_reverse: float = 0.1
+    omega_direction_change: float = 0.4
+    state_resolution: float = 0.02
 
 @dataclass
 class CarlaConfig:
@@ -41,10 +44,10 @@ class CarlaConfig:
 
 @dataclass
 class Vehicle:
-    wheelbase: float= 2.85
+    wheelbase = 0.12
     max_steering: float= 0.44157
-    length: float= 4.98
-    width: float= 1.9
+    length = 0.20
+    width = 0.09
 
     @property
     def steering_angles(self) -> list[float]:
@@ -81,11 +84,11 @@ class Node:
     def f_cost(self):
         return self.g_cost + self.h_cost
 
-@dataclass()
+@dataclass
 class GridMap3D:
     occupancy: np.ndarray | None = None
     distance: np.ndarray | None = None
-    resolution: float= 0.25
-    theta_resolution: float = math.radians(10)  # vehicle can be positioned in x degree slices per position on the grid map
+    resolution: float = 0.01
+    theta_resolution: float = math.radians(10)
     origin_x: float = 0.0
     origin_y: float = 0.0
