@@ -1,7 +1,7 @@
 {
   "source_type": "camera",
   "Camera": {
-    "device_id": 2,
+    "device_id": 0,
     "width": 1280,
     "height": 720,
     "fps": 30,

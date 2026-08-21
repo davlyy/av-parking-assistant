@@ -44,7 +44,7 @@ def _draw_text_block(frame, lines, x, y, color=(255, 255, 255), scale=0.45, thic
         cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
         cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
-def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
+def draw_debug_measurements_on_frame(frame, payload, selected_slot_id=None):
     #for x in np.arange(DEBUG_WORLD_X_MIN, DEBUG_WORLD_X_MAX + 1e-6, DEBUG_GRID_STEP):
     #    p0, p1 = _w2i(payload, [(x, DEBUG_WORLD_Y_MIN), (x, DEBUG_WORLD_Y_MAX)])
     #    cv2.line(frame, tuple(p0), tuple(p1), (60, 60, 60), 1, cv2.LINE_AA)
@@ -91,8 +91,14 @@ def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
             scale=0.45,
         )
 
-    slots = payload.get("available_parking_slots", [])
-    for i, slot in enumerate(slots):
+    slots = sorted(
+        payload.get("parking_slots", []),
+        key=lambda slot: int(slot["id"]),
+    )
+
+    for slot in slots:
+        slot_id = int(slot["id"])
+
         x, y, yaw = float(slot["x"]), float(slot["y"]), float(slot["yaw"])
         length = float(slot["length"])
         width = float(slot["width"])
@@ -100,26 +106,51 @@ def draw_debug_measurements_on_frame(frame, payload, selected_slot_index=None):
         box = _rot_box(x, y, length, width, yaw)
         box_i = _w2i(payload, box).reshape(-1, 1, 2)
 
-        color = (255, 0, 0) if i == selected_slot_index else (0, 255, 255)
-        thick = 2 if i == selected_slot_index else 1
+        selected = slot_id == selected_slot_id
+        color = (255, 0, 0) if selected else (0, 255, 255)
+        thick = 2 if selected else 1
+
         cv2.polylines(frame, [box_i], True, color, thick, cv2.LINE_AA)
 
         center = _w2i(payload, [(x, y)])[0]
         px = _w2i(payload, [(x + 0.12 * math.cos(yaw), y + 0.12 * math.sin(yaw))])[0]
         py = _w2i(payload, [(x - 0.12 * math.sin(yaw), y + 0.12 * math.cos(yaw))])[0]
+
         cv2.circle(frame, tuple(center), 3, color, -1, cv2.LINE_AA)
         cv2.arrowedLine(frame, tuple(center), tuple(px), (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
         cv2.arrowedLine(frame, tuple(center), tuple(py), (0, 255, 0), 1, cv2.LINE_AA, tipLength=0.3)
 
         label_pos = box_i.reshape(-1, 2).mean(axis=0).astype(int)
+
         _draw_text_block(
             frame,
-            [f"S{i}: L={length:.3f} W={width:.3f}", f"yaw={math.degrees(yaw):.1f}"],
+            [
+                f"S{slot_id}: L={length:.3f} W={width:.3f}",
+                f"yaw={math.degrees(yaw):.1f}",
+            ],
             int(label_pos[0]) + 6,
             int(label_pos[1]) - 8,
             color=color,
             scale=0.38,
         )
+
+def draw_planner_nodes(frame, nodes, project):
+    if not nodes:
+        return
+
+    count = len(nodes)
+
+    for i, (x, y) in enumerate(nodes):
+        t = i / max(1, count - 1)
+
+        color = (
+            int(255 * (1.0 - t)),
+            int(255 * t),
+            0,
+        )
+
+        p = project(float(x), float(y), frame)
+        cv2.circle(frame, p, 1, color, -1)
 
 def draw_drivable_area_on_frame(frame, payload: dict) -> None:
     area = payload.get("drivable_area")
@@ -200,21 +231,19 @@ def draw_box_on_frame(
 
     return pts
 
-def get_parking_slots(payload: dict) -> list[dict]:
-    slots = payload.get("parking_slots", [])
+def get_parking_slots(payload):
+    slots = payload.get("parking_slots")
+
+    if slots is None:
+        slots = payload.get("available_parking_slots", [])
+
     return sorted(
-        [{**slot, "id": int(slot["id"])} for slot in slots],
+        [
+            {**slot, "id": int(slot.get("id", i))}
+            for i, slot in enumerate(slots)
+        ],
         key=lambda slot: slot["id"],
     )
-
-    if "available_parking_slots" in payload:
-        slots = [
-            {**slot, "id": int(slot.get("id", i))}
-            for i, slot in enumerate(payload["available_parking_slots"])
-        ]
-        return sorted(slots, key=lambda s: s["id"])
-
-    return []
 
 def set_goal_from_slot(payload: dict, slot: dict) -> dict:
     payload = payload.copy()
@@ -450,34 +479,32 @@ def make_slot_overlay_mouse_callback(state: dict):
             return
 
         scale = state.get("display_scale", 1.0)
-
         if scale <= 0:
             scale = 1.0
 
         x = int(x / scale)
         y = int(y / scale)
 
-        for idx, rect in state.get("buttons", []):
+        for slot_id, rect in state.get("buttons", []):
             x1, y1, x2, y2 = rect
 
             if x1 <= x <= x2 and y1 <= y <= y2:
-                state["clicked_index"] = idx
+                state["clicked_slot_id"] = slot_id
                 return
 
-        for idx, poly in state.get("slot_polygons", []):
+        for slot_id, poly in state.get("slot_polygons", []):
             if cv2.pointPolygonTest(poly, (x, y), False) >= 0:
-                state["clicked_index"] = idx
+                state["clicked_slot_id"] = slot_id
                 return
 
     return on_mouse
-
 def compose_frame_with_side_panel(frame, panel_width=420, gap=10):
     h, w = frame.shape[:2]
     canvas = np.full((h, w + gap + panel_width, 3), 35, dtype=np.uint8)
     canvas[:, :w] = frame
     return canvas, (0, 0, w, h), (w + gap, 0, panel_width, h)
 
-def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_rect, planner_state="idle"):
+def draw_slot_overlay(frame, slots, selected_slot_id, overlay_state, panel_rect, planner_state="idle"):
     px, py, pw, ph = panel_rect
     overlay_state["buttons"] = []
 
@@ -491,8 +518,6 @@ def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_re
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
     if not slots:
-        cv2.putText(frame, "No free parking slots", (px + 18, py + 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
         return
 
     top = py + 110
@@ -502,6 +527,8 @@ def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_re
     row_height = max(23, row_step - 5)
 
     for i, slot in enumerate(slots):
+        slot_id = int(slot["id"])
+
         x1 = px + 14
         x2 = px + pw - 14
         y1 = top + i * row_step
@@ -510,7 +537,7 @@ def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_re
         if y1 >= py + ph - bottom_margin:
             break
 
-        selected = i == selected_slot_index
+        selected = slot_id == selected_slot_id
         fill = (45, 75, 45) if selected else (48, 48, 48)
         border = (0, 255, 0) if selected else (110, 110, 110)
         text_color = (220, 255, 220) if selected else (220, 220, 220)
@@ -518,19 +545,17 @@ def draw_slot_overlay(frame, slots, selected_slot_index, overlay_state, panel_re
         cv2.rectangle(frame, (x1, y1), (x2, y2), fill, -1)
         cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2 if selected else 1)
 
-        slot_id = slot.get("id", i)
-        text = f"[{i}] slot {slot_id}   x={slot['x']:.2f}   y={slot['y']:.2f}"
+        text = f"[{slot_id}] slot {slot_id}   x={slot['x']:.2f}   y={slot['y']:.2f}"
 
         cv2.putText(frame, text, (x1 + 9, y1 + min(21, row_height - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, text_color, 1, cv2.LINE_AA)
 
-        overlay_state["buttons"].append((i, (x1, y1, x2, y2)))
+        overlay_state["buttons"].append((slot_id, (x1, y1, x2, y2)))
 
-def draw_scene_on_frame(frame, payload, slots, selected_slot_id, project, state=None, parked_slot_index=None):
+def draw_scene_on_frame(frame, payload, slots, selected_slot_id, project, state=None, parked_slot_id=None):
     if state is not None:
         state["slot_polygons"] = []
 
-    # Obstacles: gelb
     for i, obs in enumerate(payload.get("obstacles", [])):
         draw_box_on_frame(
             frame,
@@ -541,36 +566,28 @@ def draw_scene_on_frame(frame, payload, slots, selected_slot_id, project, state=
             thickness=2,
         )
 
-    # Parking slots
-    for i, slot in enumerate(slots):
-        for i, slot in enumerate(slots):
-            is_selected = slot["id"] == selected_slot_id
-        is_parked = parked_slot_index == i
+    for slot in slots:
+        slot_id = int(slot["id"])
+        is_selected = slot_id == selected_slot_id
+        is_parked = slot_id == parked_slot_id
 
         if is_parked:
-            color = (0, 255, 0)      # grün
+            color = (0, 255, 0)
             thickness = 4
-            label = f"PARKED {i}"
+            label = f"PARKED {slot_id}"
         elif is_selected:
-            color = (255, 0, 0)      # blau
+            color = (255, 0, 0)
             thickness = 3
-            label = f"SELECTED {i}"
+            label = f"SELECTED {slot_id}"
         else:
-            color = (0, 255, 255)    # gelb
+            color = (0, 255, 255)
             thickness = 2
-            label = f"slot {i}"
+            label = f"slot {slot_id}"
 
-        pts = draw_box_on_frame(
-            frame,
-            slot,
-            project,
-            label=label,
-            color=color,
-            thickness=thickness,
-        )
+        pts = draw_box_on_frame(frame, slot, project, label, color, thickness)
 
         if state is not None:
-            state["slot_polygons"].append((i, pts))
+            state["slot_polygons"].append((slot_id, pts))
 
 def resize_for_display(frame, max_w: int = 1400, max_h: int = 950):
     h, w = frame.shape[:2]

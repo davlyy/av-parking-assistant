@@ -15,8 +15,8 @@ class Config:
     d0: float = 0.08
     epsilon: float = 0.01
 
-    heuristic_weight: float = 2.0
-    search_margin: float = 2.0
+    heuristic_weight: float = 3.0
+    search_margin: float = 0.5
 
     goal_tolerance: float = 0.04
     planner_goal_tolerance: float = 0.04
@@ -29,7 +29,7 @@ class Config:
     omega_steer_angle: float = 0.5
     omega_reverse: float = 0.1
     omega_direction_change: float = 0.4
-    state_resolution: float = 0.02
+    state_resolution: float = 0.025
 
 @dataclass
 class CarlaConfig:
@@ -89,6 +89,6 @@ class GridMap3D:
     occupancy: np.ndarray | None = None
     distance: np.ndarray | None = None
     resolution: float = 0.01
-    theta_resolution: float = math.radians(10)
+    theta_resolution: float = math.radians(5)
     origin_x: float = 0.0
     origin_y: float = 0.0

@@ -18,7 +18,7 @@ from mod.draw import (
     get_parking_slots, make_projector, make_slot_overlay_mouse_callback,
     set_goal_from_slot, resize_for_display, draw_drivable_area_on_frame,
     compose_frame_with_side_panel,
-    draw_debug_measurements_on_frame,
+    draw_debug_measurements_on_frame, draw_planner_nodes,
 )
 
 PATH_PREPLAN_DEVIATION = 0.03
@@ -206,8 +206,22 @@ def slot_index_by_id(slots, slot_id):
 
 def run_planner_async(payload, frame_id, reason, slot_id):
     t = time.perf_counter()
-    path = plan_path(payload, already_world=True)
-    return path, payload, frame_id, reason, slot_id, time.perf_counter() - t
+
+    path, debug_nodes = plan_path(
+        payload,
+        already_world=True,
+        collect_debug=True,
+    )
+
+    return (
+        path,
+        debug_nodes,
+        payload,
+        frame_id,
+        reason,
+        slot_id,
+        time.perf_counter() - t,
+    )
 
 
 def candidate_is_valid(candidate_path, candidate_payload, selected_slot, current_pose, obstacles):
@@ -227,8 +241,9 @@ def candidate_is_valid(candidate_path, candidate_payload, selected_slot, current
     return True, candidate_index
 
 
-def build_display_canvas(display_frame, slots, selected_slot_index, overlay_state, planner_future):
+def build_display_canvas(display_frame, slots, selected_slot_id, overlay_state, planner_future):
     planner_state = "running" if planner_future is not None else "idle"
+
     canvas, _, panel_rect = compose_frame_with_side_panel(
         display_frame,
         panel_width=UI_PANEL_WIDTH,
@@ -238,7 +253,7 @@ def build_display_canvas(display_frame, slots, selected_slot_index, overlay_stat
     draw_slot_overlay(
         canvas,
         slots,
-        selected_slot_index,
+        selected_slot_id,
         overlay_state,
         panel_rect,
         planner_state,
@@ -261,6 +276,8 @@ def run(source, config: SourceConfig) -> None:
     active_path_index = 0
     active_planning_payload = None
     planned_goal = None
+    planner_debug_nodes = []
+    force_replan = True
 
     planner_executor = ProcessPoolExecutor(max_workers=1)
     planner_future = None
@@ -274,7 +291,7 @@ def run(source, config: SourceConfig) -> None:
     overlay_state = {
         "buttons": [],
         "slot_polygons": [],
-        "clicked_index": None,
+        "clicked_slot_id": None,
         "display_scale": 1.0,
     }
 
@@ -353,16 +370,19 @@ def run(source, config: SourceConfig) -> None:
 
             force_replan = False
 
-            if overlay_state["clicked_index"] is not None:
-                clicked = overlay_state["clicked_index"]
-                overlay_state["clicked_index"] = None
+            if overlay_state["clicked_slot_id"] is not None:
+                clicked_id = overlay_state["clicked_slot_id"]
+                overlay_state["clicked_slot_id"] = None
 
-                if 0 <= clicked < len(slots) and is_slot_free(slots[clicked]):
-                    selected_slot_index = clicked
-                    selected_slot_id = slots[clicked]["id"]
+                clicked_index = slot_index_by_id(slots, clicked_id)
+
+                if clicked_index is not None and is_slot_free(slots[clicked_index]):
+                    selected_slot_id = clicked_id
                     active_path = []
+                    active_path_index = 0
                     active_planning_payload = None
                     planned_goal = None
+                    planner_debug_nodes = []
                     force_replan = True
 
             key = cv2.waitKey(1) & 0xFF
@@ -370,19 +390,24 @@ def run(source, config: SourceConfig) -> None:
 
             old_index = selected_slot_index
 
+            current_index = slot_index_by_id(slots, selected_slot_id)
+
             if key == ord("w"):
-                new_index = next_free_slot_index(slots, selected_slot_index, -1)
+                new_index = next_free_slot_index(slots, current_index, -1)
                 if new_index is not None:
-                    selected_slot_index = new_index
+                    selected_slot_id = int(slots[new_index]["id"])
+
             elif key == ord("s"):
-                new_index = next_free_slot_index(slots, selected_slot_index, 1)
+                new_index = next_free_slot_index(slots, current_index, 1)
                 if new_index is not None:
-                    selected_slot_index = new_index
+                    selected_slot_id = int(slots[new_index]["id"])
+
             elif ord("0") <= key <= ord("9"):
                 requested_id = int(chr(key))
-                new_index = slot_index_by_id(slots, requested_id)
-                if new_index is not None and is_slot_free(slots[new_index]):
-                    selected_slot_index = new_index
+                requested_index = slot_index_by_id(slots, requested_id)
+
+                if requested_index is not None and is_slot_free(slots[requested_index]):
+                    selected_slot_id = requested_id
 
             if selected_slot_index != old_index:
                 selected_slot_id = slots[selected_slot_index]["id"]
@@ -403,7 +428,9 @@ def run(source, config: SourceConfig) -> None:
 
             if planner_future is not None and planner_future.done():
                 try:
-                    candidate_path, candidate_payload, planned_frame, reason, candidate_slot_id, planner_time = planner_future.result()
+                    candidate_path, candidate_debug_nodes, candidate_payload, planned_frame, reason, candidate_slot_id, planner_time = planner_future.result()
+
+                    planner_debug_nodes = candidate_debug_nodes
                     planner_total += planner_time
                     planner_calls += 1
 
@@ -414,6 +441,8 @@ def run(source, config: SourceConfig) -> None:
                             f"planned_slot={candidate_slot_id} current_slot={selected_slot_id}"
                         )
                     else:
+                        planner_debug_nodes = candidate_debug_nodes
+
                         valid, candidate_index = candidate_is_valid(
                             candidate_path,
                             candidate_payload,
@@ -427,10 +456,6 @@ def run(source, config: SourceConfig) -> None:
                             active_path_index = candidate_index
                             active_planning_payload = candidate_payload
                             planned_goal = candidate_payload["goal_pose"].copy()
-                            print(
-                                f"[Candidate accepted] frame={planned_frame} "
-                                f"reason={reason} time={planner_time * 1000:.1f} ms"
-                            )
                         else:
                             planner_discarded += 1
                             print(
@@ -530,11 +555,15 @@ def run(source, config: SourceConfig) -> None:
                 display_frame,
                 payload,
                 slots,
-                selected_slot_index,
+                selected_slot_id,
                 project,
                 overlay_state,
             )
-            draw_debug_measurements_on_frame(display_frame, planning_payload_current, selected_slot_index)
+            draw_debug_measurements_on_frame(
+                display_frame,
+                planning_payload_current,
+                selected_slot_id,
+            )
             display_path = trim_path_for_display(active_path, current_pose, active_path_index)
 
             if display_path and active_planning_payload is not None:
@@ -545,11 +574,16 @@ def run(source, config: SourceConfig) -> None:
                     active_planning_payload["goal_pose"],
                     thickness=6,
                 )
+                draw_planner_nodes(
+                    display_frame,
+                    planner_debug_nodes,
+                    project,
+                )
 
             canvas = build_display_canvas(
                 display_frame,
                 slots,
-                selected_slot_index,
+                selected_slot_id,
                 overlay_state,
                 planner_future,
             )

@@ -14,6 +14,7 @@ def plan_path(
     payload: dict,
     ego_world_pose: dict | None = None,
     already_world: bool = False,
+    collect_debug= False
 ) -> list[Node]:
     if not already_world:
         transform_cfg = get_coordinate_transform(payload)
@@ -55,17 +56,25 @@ def plan_path(
         "goal_free=", is_collision_free(gridmap, end),
     )
 
-    path = hybrid_A_star(gridmap, start, end)
+    debug_nodes = [] if collect_debug else None
+    path = hybrid_A_star(gridmap, start, end, debug_nodes)
 
     if path is None:
         print("Hybrid A* found no path")
-        return []
+        result = []
+    else:
+        result = flatten_path(path)
+
+    if collect_debug:
+        return result, debug_nodes
+
+    return result
 
     return flatten_path(path)
 
 type_checking_variable: PathPlanning = plan_path
 
-def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
+def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node, debug_nodes=None) -> list | None:
     closed_rejects = 0
     collision_rejects = 0
     corridor_rejects = 0
@@ -105,6 +114,8 @@ def hybrid_A_star(gridmap: GridMap3D, start: Node, end: Node) -> list | None:
             return None
 
         closed.add(current.idx)
+        if debug_nodes is not None and iterations % 5 == 0 and len(debug_nodes) < 5000:
+            debug_nodes.append((current.x, current.y))
 
         dist_to_goal = position_distance(current, end)
         yaw_to_goal = parking_yaw_distance(current.theta, end.theta)
@@ -359,7 +370,7 @@ def position_distance(node: Node, end: Node) -> float:
     return math.hypot(end.x - node.x, end.y - node.y)
 
 def heuristic_cost(node: Node, end: Node) -> float:
-    return position_distance(node, end) + 0.2 * yaw_distance(node.theta, end.theta)
+    return position_distance(node, end) + 0.2 * parking_yaw_distance(node.theta, end.theta)
 
 def yaw_distance(a: float, b: float) -> float:
     return abs(normalize_angle(a - b))
@@ -396,7 +407,8 @@ def make_idx(x: float, y: float, theta: float, gridmap: GridMap3D) -> tuple[int,
     y_idx = int(round((y - gridmap.origin_y) / config.state_resolution))
 
     theta_norm = normalize_angle(theta)
-    theta_idx = int(np.floor((theta_norm + np.pi) / gridmap.theta_resolution))
+    theta_bins = int(round(2 * np.pi / gridmap.theta_resolution))
+    theta_idx = int(round(theta_norm / gridmap.theta_resolution)) % theta_bins
 
     return x_idx, y_idx, theta_idx
 
@@ -617,7 +629,7 @@ def is_collision_free(gridmap: GridMap3D, node) -> bool:
     c = np.cos(node.theta)
     s = np.sin(node.theta)
 
-    radius = vehicle.width / 2 + 0.01
+    radius = vehicle.width / 2
     max_offset = vehicle.length / 2 - vehicle.width / 2
 
     for offset in np.linspace(-max_offset, max_offset, 5):
