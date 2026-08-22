@@ -17,7 +17,7 @@ load_dotenv()
 # Constants
 ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "parking-lot-npjkj/2")
-YOLO_MODEL_PATH = "best.pt"
+YOLO_MODEL_PATH = "best_pose.pt"
 DEBUG = False
 ARUCO_UPDATE_INTERVAL = 2
 YOLO_IMGSZ = 640
@@ -232,6 +232,7 @@ def detection_to_world(pred, H):
     x, y = image_to_world(pred["x"], pred["y"], H)
 
     x1, y1, x2, y2 = pred["bbox_px"]
+
     lx, ly = image_to_world(x1, pred["y"], H)
     rx, ry = image_to_world(x2, pred["y"], H)
     tx, ty = image_to_world(pred["x"], y1, H)
@@ -240,13 +241,34 @@ def detection_to_world(pred, H):
     size_x = np.hypot(rx - lx, ry - ly)
     size_y = np.hypot(bx - tx, by - ty)
 
-    return {
+    result = {
         **pred,
         "world_x": x,
         "world_y": y,
         "world_length": max(size_x, size_y),
         "world_width": min(size_x, size_y),
     }
+
+    rear_px = pred.get("rear_px")
+    front_px = pred.get("front_px")
+
+    if rear_px is not None and front_px is not None:
+        rear_x, rear_y = image_to_world(rear_px[0], rear_px[1], H)
+        front_x, front_y = image_to_world(front_px[0], front_px[1], H)
+
+        axis_length = np.hypot(front_x - rear_x, front_y - rear_y)
+
+        if axis_length > 0.01:
+            result["world_rear"] = (rear_x, rear_y)
+            result["world_front"] = (front_x, front_y)
+            result["world_yaw"] = float(
+                np.arctan2(
+                    front_y - rear_y,
+                    front_x - rear_x,
+                )
+            )
+
+    return result
 
 #Calibration
 def calibrate_from_ego(ego: dict) -> float:
@@ -307,8 +329,10 @@ def size_to_metric(w_px, h_px):
            round(h_px / PIXELS_PER_METER, 3)
 
 def estimate_yaw(pred):
-    """Estimate yaw from slot/car orientation. Vertical slot = pi/2."""
-    return round(np.pi / 2, 4) if pred['height'] > pred['width'] else 0.0
+    if "world_yaw" in pred:
+        return round(float(pred["world_yaw"]), 4)
+
+    return round(np.pi / 2, 4) if pred["height"] > pred["width"] else 0.0
 
 def dist(a, b):
     return np.hypot(a['x'] - b['x'], a['y'] - b['y'])
@@ -809,10 +833,7 @@ def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
         if not Path(model_path).is_file():
             raise FileNotFoundError(f"YOLO model not found: {model_path}")
 
-        try:
-            from ultralytics import YOLO
-        except ImportError as error:
-            raise RuntimeError("YOLO detection requires ultralytics. Run: pip install ultralytics") from error
+        from ultralytics import YOLO
 
         _yolo_model = YOLO(model_path)
         _yolo_model_path = model_path
@@ -837,11 +858,15 @@ def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
     confidences = boxes.conf.cpu().numpy()
     track_ids = boxes.id.int().cpu().numpy() if boxes.id is not None else [None] * len(boxes)
 
+    keypoints_xy = None
+    if result.keypoints is not None and result.keypoints.xy is not None:
+        keypoints_xy = result.keypoints.xy.cpu().numpy()
+
     cars = []
     avail = []
     predictions = []
 
-    for coords, class_id, conf, track_id in zip(xyxy, class_ids, confidences, track_ids):
+    for i, (coords, class_id, conf, track_id) in enumerate(zip(xyxy, class_ids, confidences, track_ids)):
         x1, y1, x2, y2 = coords
 
         class_id = int(class_id)
@@ -854,6 +879,21 @@ def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
         width = float(x2 - x1)
         height = float(y2 - y1)
 
+        rear_px = None
+        front_px = None
+
+        if keypoints_xy is not None and i < len(keypoints_xy) and len(keypoints_xy[i]) >= 2:
+            rear = keypoints_xy[i][0]
+            front = keypoints_xy[i][1]
+
+            if (
+                np.all(np.isfinite(rear))
+                and np.all(np.isfinite(front))
+                and np.linalg.norm(front - rear) > 3.0
+            ):
+                rear_px = (float(rear[0]), float(rear[1]))
+                front_px = (float(front[0]), float(front[1]))
+
         prediction = {
             "x": x,
             "y": y,
@@ -863,6 +903,8 @@ def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
             "class": class_name,
             "class_id": class_id,
             "track_id": track_id,
+            "rear_px": rear_px,
+            "front_px": front_px,
         }
 
         entry = {
@@ -876,6 +918,8 @@ def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
             "size_px": (width, height),
             "bbox_px": (int(x1), int(y1), int(x2), int(y2)),
             "track_id": track_id,
+            "rear_px": rear_px,
+            "front_px": front_px,
         }
 
         predictions.append(prediction)
@@ -886,9 +930,6 @@ def detect_vehicles_yolo(frame, model_path=YOLO_MODEL_PATH, confidence=0.6):
             cars.append(entry)
         elif label in {"free", "avail"}:
             avail.append(entry)
-
-    debug_print(f"[Debug] YOLO raw predictions: {len(predictions)}")
-    debug_print(f"[Debug] YOLO Cars: {len(cars)}, Available slots: {len(avail)}")
 
     return cars, avail, predictions
 
@@ -1212,6 +1253,23 @@ def _draw_raw_predictions(frame, raw_predictions):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
     return vis
 
+def build_pose_predictions(cars):
+    result = []
+
+    for car in cars:
+        rear = car.get("rear_px")
+        front = car.get("front_px")
+
+        if rear is None or front is None:
+            continue
+
+        result.append({
+            "track_id": car.get("track_id"),
+            "rear": [float(rear[0]), float(rear[1])],
+            "front": [float(front[0]), float(front[1])],
+        })
+
+    return result
 
 def _draw_ego_selection(frame, cars, ego, obstacles):
     """Show the red-colour ego decision before payload generation."""
@@ -1252,6 +1310,7 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
     input_calibration = _cached_input_calibration
 
     cars, avail, raw_preds = run_vehicle_detector(frame, detector, yolo_model_path, confidence)
+    pose_predictions = build_pose_predictions(cars)
 
     ego = select_ego(cars, frame)
     ego_track_id = ego.get("track_id") if ego else None
@@ -1308,6 +1367,8 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
         parking_mat_corners=parking_mat_corners,
         input_calibration=input_calibration,
     )
+    if payload is not None:
+        payload["pose_predictions"] = pose_predictions
 
     result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
 

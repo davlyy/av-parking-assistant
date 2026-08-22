@@ -531,6 +531,67 @@ def compose_frame_with_side_panel(frame, panel_width=420, gap=10):
     canvas[:, :w] = frame
     return canvas, (0, 0, w, h), (w + gap, 0, panel_width, h)
 
+def draw_pose_predictions(frame, payload):
+    poses = payload.get("pose_predictions", [])
+    if not poses:
+        return
+
+    frame_h, frame_w = frame.shape[:2]
+    payload_w = float(payload.get("image_width", frame_w))
+    payload_h = float(payload.get("image_height", frame_h))
+
+    sx = frame_w / payload_w if payload_w > 0 else 1.0
+    sy = frame_h / payload_h if payload_h > 0 else 1.0
+
+    for pose in poses:
+        rear = pose.get("rear")
+        front = pose.get("front")
+
+        if rear is None or front is None:
+            continue
+
+        rear_p = np.array([
+            rear[0] * sx,
+            rear[1] * sy,
+        ], dtype=np.float32)
+
+        front_p = np.array([
+            front[0] * sx,
+            front[1] * sy,
+        ], dtype=np.float32)
+
+        direction = front_p - rear_p
+        length = np.linalg.norm(direction)
+
+        if length < 2.0:
+            continue
+
+        direction /= length
+        center = (rear_p + front_p) / 2.0
+
+        arrow_length = max(70.0, length * 2.5)
+
+        arrow_start = center - direction * arrow_length * 0.5
+        arrow_end = center + direction * arrow_length * 0.5
+
+        rear_i = tuple(np.round(rear_p).astype(int))
+        front_i = tuple(np.round(front_p).astype(int))
+        start_i = tuple(np.round(arrow_start).astype(int))
+        end_i = tuple(np.round(arrow_end).astype(int))
+
+        cv2.circle(frame, rear_i, 5, (255, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(frame, front_i, 5, (0, 0, 255), -1, cv2.LINE_AA)
+
+        cv2.arrowedLine(
+            frame,
+            start_i,
+            end_i,
+            (0, 255, 255),
+            3,
+            cv2.LINE_AA,
+            tipLength=0.2,
+        )
+
 def draw_slot_overlay(frame, slots, selected_slot_id, overlay_state, panel_rect, planner_state="idle"):
     px, py, pw, ph = panel_rect
     overlay_state["buttons"] = []
@@ -550,6 +611,7 @@ def draw_slot_overlay(frame, slots, selected_slot_id, overlay_state, panel_rect,
         ("measurements", "Geometry"),
         ("aruco_axes", "ArUco axes"),
         ("drivable_area", "Drivable area"),
+        ("pose_prediction", "Pose"),
     ]
 
     margin = 14
@@ -581,7 +643,8 @@ def draw_slot_overlay(frame, slots, selected_slot_id, overlay_state, panel_rect,
 
         overlay_state["debug_buttons"].append((key, (x1, y1, x2, y2)))
 
-    slots_title_y = debug_top + 2 * (button_h + gap) + 8
+    debug_rows = math.ceil(len(debug_items) / debug_cols)
+    slots_title_y = debug_top + debug_rows * (button_h + gap) + 8
 
     cv2.putText(frame, "Parking slots", (px + margin, slots_title_y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)

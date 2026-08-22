@@ -19,7 +19,7 @@ from mod.draw import (
     set_goal_from_slot, resize_for_display, draw_drivable_area_on_frame,
     compose_frame_with_side_panel,
     draw_debug_measurements_on_frame, draw_planner_nodes,
-    draw_parking_mat_on_frame,
+    draw_parking_mat_on_frame, draw_pose_predictions,
 )
 
 PATH_PREPLAN_DEVIATION = 0.03
@@ -332,6 +332,7 @@ def run(source, config: SourceConfig) -> None:
             "measurements": False,
             "aruco_axes": True,
             "drivable_area": True,
+            "pose_prediction": True,
         },
     }
 
@@ -609,6 +610,10 @@ def run(source, config: SourceConfig) -> None:
             #draw_parking_mat_on_frame(display_frame, payload)
             if overlay_state["debug"]["drivable_area"]:
                 draw_drivable_area_on_frame(display_frame, payload)
+
+            if overlay_state["debug"]["pose_prediction"]:
+                draw_pose_predictions(display_frame, payload)
+
             draw_scene_on_frame(
                 display_frame,
                 payload,
