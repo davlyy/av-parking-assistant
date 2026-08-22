@@ -8,14 +8,14 @@ Coordinate2D = tuple[int, int]
 @dataclass
 class Config:
     dsize: float = 0.04
-    omega_1: float = 0.5
-    omega_2: float = 0.5
+    omega_1: float = 0.35
+    omega_2: float = 0.1
     omega_3: float = 5.0
 
     d0: float = 0.08
     epsilon: float = 0.01
 
-    heuristic_weight: float = 3.0
+    heuristic_weight: float = 2.5
     search_margin: float = 0.5
 
     goal_tolerance: float = 0.04
@@ -26,9 +26,9 @@ class Config:
     near_goal_dsize: float = 0.03
 
     max_iterations: int = 200000
-    omega_steer_angle: float = 0.5
-    omega_reverse: float = 0.1
-    omega_direction_change: float = 0.4
+    omega_steer_angle: float = 0.35
+    omega_reverse: float = 1.2
+    omega_direction_change: float = 2.0
     state_resolution: float = 0.025
 
 @dataclass

@@ -17,15 +17,15 @@ ROBOFLOW_API_KEY  = os.environ.get("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "parking-lot-npjkj/2")
 YOLO_MODEL_PATH = "best.pt"
 DEBUG = False
-ARUCO_UPDATE_INTERVAL = 4
+ARUCO_UPDATE_INTERVAL = 2
 YOLO_IMGSZ = 640
 PARKING_MAT_WIDTH_M = 1.80
 PARKING_MAT_HEIGHT_M = 1.
 
-SHEET_EXTEND_LEFT = 0.6
-SHEET_EXTEND_RIGHT = 0.6
+SHEET_EXTEND_LEFT = 0.4
+SHEET_EXTEND_RIGHT = 0.4
 SHEET_EXTEND_TOP = 0.15
-SHEET_EXTEND_BOTTOM = 0.30
+SHEET_EXTEND_BOTTOM = 0.15
 
 DRIVABLE_AREA_WORLD = [
     (-SHEET_EXTEND_LEFT, -SHEET_EXTEND_TOP),
@@ -52,6 +52,8 @@ PARKING_SLOT_Y_STEP = 0.1465
 #PARKING_SLOT_LENGTH = 0.60
 #PARKING_SLOT_WIDTH = PARKING_SLOT_Y_STEP
 PARKING_SLOT_COUNT_PER_SIDE = 8
+RED_ACQUIRE_RATIO = 0.10
+RED_KEEP_RATIO = 0.04
 
 
 PARKING_SLOT_X_STEP = PARKING_MAT_WIDTH_M / PARKING_SLOT_COUNT_PER_SIDE
@@ -827,26 +829,45 @@ def run_vehicle_detector(frame, detector, yolo_model_path, confidence):
         return detect_vehicles_yolo(frame, yolo_model_path, confidence)
     return detect_vehicles(frame)
 
+def red_ratio(car, frame):
+    x1, y1, x2, y2 = car["bbox_px"]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    dx = int((x2 - x1) * 0.15)
+    dy = int((y2 - y1) * 0.15)
+
+    roi = frame[y1 + dy:y2 - dy, x1 + dx:x2 - dx]
+    if roi.size == 0:
+        return 0.0
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    mask1 = cv2.inRange(hsv, (0, 80, 50), (10, 255, 255))
+    mask2 = cv2.inRange(hsv, (170, 80, 50), (179, 255, 255))
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    return cv2.countNonZero(mask) / mask.size
+
 #[Stage 4]: Identify Ego Vehicle
 def identify_ego(cars, frame):
-    """
-    Ego vehicle = the detected car with the strongest average red colour.
-
-    For each Roboflow car bounding box, calculate the mean BGR pixel colour
-    and score red dominance as R / (B + G + 1). The red toy car therefore has
-    the highest score even when it is not the furthest car from a free slot.
-    """
     if not cars:
         return None, []
 
-    def redness_score(car):
-        x1, y1, x2, y2 = car['bbox_px']
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-        b, g, r, _ = cv2.mean(frame[y1:y2, x1:x2])
-        return r / (b + g + 1.0)
+    scored = [(red_ratio(car, frame), car) for car in cars]
+    score, ego = max(scored, key=lambda x: x[0])
+
+    if DEBUG:
+        print("[Ego]", [(car.get("track_id"), round(s, 3)) for s, car in scored])
+
+    if score < RED_ACQUIRE_RATIO:
+        return None, cars
+
+    obstacles = [car for car in cars if car is not ego]
+    return ego, obstacles
 
     ego       = max(cars, key=redness_score)
     obstacles = [c for c in cars if c is not ego]
@@ -855,59 +876,68 @@ def identify_ego(cars, frame):
 def select_ego(cars, frame, max_missing=8):
     global _ego_track_id, _ego_last, _ego_velocity, _ego_missing_frames, _ego_reacquire_votes
 
-    if _ego_track_id is None:
-        ego, _ = identify_ego(cars, frame)
-        if ego is None or ego.get("track_id") is None:
-            return None
-        _ego_track_id = ego["track_id"]
-        _ego_last = ego.copy()
-        _ego_missing_frames = 0
-        print("Ego track initialized:", _ego_track_id)
-        return ego
+    tracked = next((car for car in cars if car.get("track_id") == _ego_track_id), None)
 
-    ego = next((car for car in cars if car.get("track_id") == _ego_track_id), None)
-
-    if ego is not None:
+    if tracked is not None and red_ratio(tracked, frame) >= RED_KEEP_RATIO:
         if _ego_last is not None:
-            _ego_velocity[:] = [ego["x"] - _ego_last["x"], ego["y"] - _ego_last["y"]]
-        _ego_last = ego.copy()
+            _ego_velocity[:] = [
+                tracked["x"] - _ego_last["x"],
+                tracked["y"] - _ego_last["y"],
+            ]
+
+        _ego_last = tracked.copy()
         _ego_missing_frames = 0
         _ego_reacquire_votes.clear()
-        return ego
+        return tracked
+
+    candidate, _ = identify_ego(cars, frame)
+
+    if candidate is not None and candidate.get("track_id") is not None:
+        candidate_id = candidate["track_id"]
+
+        if _ego_track_id is None:
+            _ego_track_id = candidate_id
+            _ego_last = candidate.copy()
+            _ego_missing_frames = 0
+            print("Ego track initialized:", candidate_id)
+            return candidate
+
+        if candidate_id != _ego_track_id:
+            _ego_reacquire_votes.append(candidate_id)
+
+            if _ego_reacquire_votes.count(candidate_id) >= 3:
+                print("Ego track reacquired:", _ego_track_id, "->", candidate_id)
+                _ego_track_id = candidate_id
+                _ego_last = candidate.copy()
+                _ego_velocity[:] = 0
+                _ego_missing_frames = 0
+                _ego_reacquire_votes.clear()
+                return candidate
 
     _ego_missing_frames += 1
 
     if _ego_last is not None and _ego_missing_frames <= max_missing:
         ego = _ego_last.copy()
-        dx, dy = float(_ego_velocity[0]), float(_ego_velocity[1])
+
+        dx = float(_ego_velocity[0])
+        dy = float(_ego_velocity[1])
+
         ego["x"] += dx
         ego["y"] += dy
+
         x1, y1, x2, y2 = ego["bbox_px"]
-        ego["bbox_px"] = (int(x1 + dx), int(y1 + dy), int(x2 + dx), int(y2 + dy))
+        ego["bbox_px"] = (
+            int(x1 + dx),
+            int(y1 + dy),
+            int(x2 + dx),
+            int(y2 + dy),
+        )
+
         ego["center_px"] = (ego["x"], ego["y"])
         ego["tracked_only"] = True
         _ego_last = ego
+
         return ego
-
-    candidate, _ = identify_ego(cars, frame)
-
-    if candidate is None or candidate.get("track_id") is None:
-        return None
-
-    _ego_reacquire_votes.append(candidate["track_id"])
-
-    winner = max(set(_ego_reacquire_votes), key=_ego_reacquire_votes.count)
-
-    if _ego_reacquire_votes.count(winner) >= 3:
-        ego = next((car for car in cars if car.get("track_id") == winner), None)
-        if ego is not None:
-            print("Ego track reacquired:", _ego_track_id, "->", winner)
-            _ego_track_id = winner
-            _ego_last = ego.copy()
-            _ego_velocity[:] = 0
-            _ego_missing_frames = 0
-            _ego_reacquire_votes.clear()
-            return ego
 
     return None
 
@@ -1138,9 +1168,16 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
     input_calibration = _cached_input_calibration
 
     cars, avail, raw_preds = run_vehicle_detector(frame, detector, yolo_model_path, confidence)
+
     ego = select_ego(cars, frame)
     ego_track_id = ego.get("track_id") if ego else None
-    obstacles = [car for car in cars if car.get("track_id") != ego_track_id]
+
+    obstacles = [
+        car for car in cars
+        if car is not ego
+        and (ego_track_id is None or car.get("track_id") != ego_track_id)
+        and red_ratio(car, frame) < RED_ACQUIRE_RATIO
+    ]
 
     avail = filter_slots_by_median_area(avail)
     avail = remove_slots_containing_ego(avail, ego)
@@ -1153,13 +1190,18 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
 
     if ego is not None:
         ego = detection_to_world(ego, H_image_to_world)
+
         if not ego.get("tracked_only", False):
             _ego_size_history.append((
                 ego["world_length"],
                 ego["world_width"],
             ))
 
-    obstacles = [detection_to_world(o, H_image_to_world) for o in obstacles]
+    obstacles = [
+        detection_to_world(obstacle, H_image_to_world)
+        for obstacle in obstacles
+    ]
+
     slots = assign_occupancy_to_slots(cars, H_image_to_world)
 
     debug_print(
@@ -1169,7 +1211,10 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
     )
 
     payload = build_astar_payload(
-        ego, obstacles, slots, H_world_to_image,
+        ego,
+        obstacles,
+        slots,
+        H_world_to_image,
         frame_id=frame_id,
         image_width=frame.shape[1],
         image_height=frame.shape[0],

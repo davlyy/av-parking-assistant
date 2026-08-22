@@ -17,6 +17,10 @@ DEBUG_WORLD_Y_MIN = 0.0
 DEBUG_WORLD_Y_MAX = 1.2
 DEBUG_GRID_STEP = 0.1
 
+SHOW_DEBUG_TEXT = False
+SHOW_SLOT_IDS = True
+SHOW_NODE_CLOUD = True
+
 def _w2i(payload, pts):
     H = np.asarray(payload["projection"]["H_world_to_image"], dtype=np.float32)
     pts = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
@@ -40,9 +44,16 @@ def _rot_box(x, y, length, width, yaw):
 
 def _draw_text_block(frame, lines, x, y, color=(255, 255, 255), scale=0.45, thickness=1):
     dy = int(18 * scale / 0.45)
-    for i, line in enumerate(lines):
-        cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-        cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+    if SHOW_DEBUG_TEXT:
+        for i, line in enumerate(lines):
+            cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(frame, line, (x, y + i * dy), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+def project_world_to_image(points_world, H_world_to_image):
+    pts = np.array([[x, y, 1.0] for x, y in points_world], dtype=np.float32).T
+    img = H_world_to_image @ pts
+    img /= img[2]
+    return [(int(img[0, i]), int(img[1, i])) for i in range(img.shape[1])]
 
 def draw_debug_measurements_on_frame(frame, payload, selected_slot_id=None):
     #for x in np.arange(DEBUG_WORLD_X_MIN, DEBUG_WORLD_X_MAX + 1e-6, DEBUG_GRID_STEP):
@@ -74,7 +85,8 @@ def draw_debug_measurements_on_frame(frame, payload, selected_slot_id=None):
         front_axle = _w2i(payload, [(x + 0.5 * wheelbase * math.cos(yaw), y + 0.5 * wheelbase * math.sin(yaw))])[0]
 
         cv2.circle(frame, tuple(center), 4, (0, 255, 255), -1, cv2.LINE_AA)
-        cv2.arrowedLine(frame, tuple(center), tuple(front), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.25)
+        if SHOW_DEBUG_TEXT:
+            cv2.arrowedLine(frame, tuple(center), tuple(front), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.25)
         cv2.line(frame, tuple(rear_axle), tuple(front_axle), (255, 255, 0), 2, cv2.LINE_AA)
 
         tl = box_i.reshape(-1, 2).min(axis=0)
@@ -218,16 +230,17 @@ def draw_box_on_frame(
         color,
         thickness=-1,
     )
+    if SHOW_DEBUG_TEXT:
 
-    cv2.putText(
-        frame,
-        label,
-        (center_u + 6, center_v - 6),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        color,
-        2,
-    )
+        cv2.putText(
+            frame,
+            label,
+            (center_u + 6, center_v - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            2,
+        )
 
     return pts
 
@@ -381,16 +394,17 @@ def draw_slot_selection_overlay(
         (30, 30, 30),
         thickness=-1,
     )
+    if SHOW_DEBUG_TEXT:
 
-    cv2.putText(
-        frame,
-        "Select parking slot",
-        (panel_x1 + 15, panel_y1 + 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
-    )
+        cv2.putText(
+            frame,
+            "Select parking slot",
+            (panel_x1 + 15, panel_y1 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
 
     state["buttons"] = []
 
@@ -473,7 +487,7 @@ def build_slot_panel(slots, selected_index: int) -> np.ndarray:
 
     return panel
 
-def make_slot_overlay_mouse_callback(state: dict):
+def make_slot_overlay_mouse_callback(state):
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
@@ -485,9 +499,14 @@ def make_slot_overlay_mouse_callback(state: dict):
         x = int(x / scale)
         y = int(y / scale)
 
+        for key, rect in state.get("debug_buttons", []):
+            x1, y1, x2, y2 = rect
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                state["debug"][key] = not state["debug"].get(key, False)
+                return
+
         for slot_id, rect in state.get("buttons", []):
             x1, y1, x2, y2 = rect
-
             if x1 <= x <= x2 and y1 <= y <= y2:
                 state["clicked_slot_id"] = slot_id
                 return
@@ -498,6 +517,7 @@ def make_slot_overlay_mouse_callback(state: dict):
                 return
 
     return on_mouse
+
 def compose_frame_with_side_panel(frame, panel_width=420, gap=10):
     h, w = frame.shape[:2]
     canvas = np.full((h, w + gap + panel_width, 3), 35, dtype=np.uint8)
@@ -507,48 +527,95 @@ def compose_frame_with_side_panel(frame, panel_width=420, gap=10):
 def draw_slot_overlay(frame, slots, selected_slot_id, overlay_state, panel_rect, planner_state="idle"):
     px, py, pw, ph = panel_rect
     overlay_state["buttons"] = []
+    overlay_state["debug_buttons"] = []
 
     cv2.rectangle(frame, (px, py), (px + pw - 1, py + ph - 1), (35, 35, 35), -1)
 
-    cv2.putText(frame, "Parking slot selection", (px + 18, py + 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, "click / 0-9 / W-S / Q", (px + 18, py + 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"Planner: {planner_state}", (px + 18, py + 87),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, "AV Parking Assistant", (px + 16, py + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Planner: {planner_state}", (px + 16, py + 52),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (190, 190, 190), 1, cv2.LINE_AA)
 
-    if not slots:
-        return
+    debug = overlay_state["debug"]
 
-    top = py + 110
-    bottom_margin = 15
-    available_height = max(1, ph - 110 - bottom_margin)
-    row_step = min(44, max(27, available_height // len(slots)))
-    row_height = max(23, row_step - 5)
+    debug_items = [
+        ("planner_nodes", "Nodes"),
+        ("measurements", "Geometry"),
+        ("aruco_axes", "ArUco axes"),
+    ]
+
+    margin = 14
+    gap = 8
+    button_h = 30
+    debug_top = py + 68
+    debug_cols = 2
+    debug_w = (pw - 2 * margin - gap) // 2
+
+    for i, (key, label) in enumerate(debug_items):
+        col = i % debug_cols
+        row = i // debug_cols
+
+        x1 = px + margin + col * (debug_w + gap)
+        y1 = debug_top + row * (button_h + gap)
+        x2 = x1 + debug_w
+        y2 = y1 + button_h
+
+        enabled = debug.get(key, False)
+        fill = (45, 75, 45) if enabled else (48, 48, 48)
+        border = (0, 255, 0) if enabled else (100, 100, 100)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), fill, -1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), border, 1)
+
+        text = f"[{'x' if enabled else ' '}] {label}"
+        cv2.putText(frame, text, (x1 + 8, y1 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.43, (225, 225, 225), 1, cv2.LINE_AA)
+
+        overlay_state["debug_buttons"].append((key, (x1, y1, x2, y2)))
+
+    slots_title_y = debug_top + 2 * (button_h + gap) + 8
+
+    cv2.putText(frame, "Parking slots", (px + margin, slots_title_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+    slot_top = slots_title_y + 14
+    slot_gap_x = 8
+    slot_gap_y = 5
+    slot_w = (pw - 2 * margin - slot_gap_x) // 2
+    slot_h = 27
 
     for i, slot in enumerate(slots):
         slot_id = int(slot["id"])
+        col = i % 2
+        row = i // 2
 
-        x1 = px + 14
-        x2 = px + pw - 14
-        y1 = top + i * row_step
-        y2 = min(y1 + row_height, py + ph - bottom_margin)
+        x1 = px + margin + col * (slot_w + slot_gap_x)
+        y1 = slot_top + row * (slot_h + slot_gap_y)
+        x2 = x1 + slot_w
+        y2 = y1 + slot_h
 
-        if y1 >= py + ph - bottom_margin:
-            break
-
+        free = bool(slot.get("free", True))
         selected = slot_id == selected_slot_id
-        fill = (45, 75, 45) if selected else (48, 48, 48)
-        border = (0, 255, 0) if selected else (110, 110, 110)
-        text_color = (220, 255, 220) if selected else (220, 220, 220)
+
+        if not free:
+            fill = (55, 35, 35)
+            border = (0, 0, 255)
+            text_color = (150, 150, 255)
+        elif selected:
+            fill = (45, 75, 45)
+            border = (0, 255, 0)
+            text_color = (220, 255, 220)
+        else:
+            fill = (48, 48, 48)
+            border = (100, 100, 100)
+            text_color = (220, 220, 220)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), fill, -1)
         cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2 if selected else 1)
 
-        text = f"[{slot_id}] slot {slot_id}   x={slot['x']:.2f}   y={slot['y']:.2f}"
-
-        cv2.putText(frame, text, (x1 + 9, y1 + min(21, row_height - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, text_color, 1, cv2.LINE_AA)
+        text = f"[{slot_id}] x={slot['x']:.2f} y={slot['y']:.2f}"
+        cv2.putText(frame, text, (x1 + 6, y1 + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, text_color, 1, cv2.LINE_AA)
 
         overlay_state["buttons"].append((slot_id, (x1, y1, x2, y2)))
 
@@ -648,6 +715,29 @@ def draw_path_to_goal_on_frame(frame, path, project, goal_pose: dict, color=(0, 
         (255, 0, 255),
         2,
     )
+
+def draw_parking_mat_on_frame(frame, payload, color=(255, 0, 255), thickness=2):
+    projection = payload.get("projection", {})
+    H_list = projection.get("H_world_to_image")
+    if H_list is None:
+        return
+
+    H = np.array(H_list, dtype=np.float32)
+
+    PARKING_MAT_WORLD = [
+        (0.0, 0.0),
+        (1.8, 0.0),
+        (1.8, 1.0),
+        (0.0, 1.0),
+    ]
+
+    pts = project_world_to_image(PARKING_MAT_WORLD, H)
+    pts_np = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.polylines(frame, [pts_np], True, color, thickness, cv2.LINE_AA)
+
+    for i, (x, y) in enumerate(pts):
+        cv2.circle(frame, (x, y), 5, color, -1)
+        cv2.putText(frame, f"MAT{i}", (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 def make_bounds_projector(projection: dict):
     required = ["center_x", "center_y", "extent_x", "extent_y"]

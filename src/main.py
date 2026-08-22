@@ -19,6 +19,7 @@ from mod.draw import (
     set_goal_from_slot, resize_for_display, draw_drivable_area_on_frame,
     compose_frame_with_side_panel,
     draw_debug_measurements_on_frame, draw_planner_nodes,
+    draw_parking_mat_on_frame,
 )
 
 PATH_PREPLAN_DEVIATION = 0.03
@@ -290,9 +291,15 @@ def run(source, config: SourceConfig) -> None:
 
     overlay_state = {
         "buttons": [],
+        "debug_buttons": [],
         "slot_polygons": [],
         "clicked_slot_id": None,
         "display_scale": 1.0,
+        "debug": {
+            "planner_nodes": True,
+            "measurements": False,
+            "aruco_axes": True,
+        },
     }
 
     timing_sum = {
@@ -549,7 +556,7 @@ def run(source, config: SourceConfig) -> None:
             t = time.perf_counter()
 
             display_frame = prediction_frame.copy() if prediction_frame is not None else frame.copy()
-
+            draw_parking_mat_on_frame(display_frame, payload)
             draw_drivable_area_on_frame(display_frame, payload)
             draw_scene_on_frame(
                 display_frame,
@@ -559,11 +566,12 @@ def run(source, config: SourceConfig) -> None:
                 project,
                 overlay_state,
             )
-            draw_debug_measurements_on_frame(
-                display_frame,
-                planning_payload_current,
-                selected_slot_id,
-            )
+            if overlay_state["debug"]["measurements"]:
+                draw_debug_measurements_on_frame(
+                    display_frame,
+                    planning_payload_current,
+                    selected_slot_id,
+                )
             display_path = trim_path_for_display(active_path, current_pose, active_path_index)
 
             if display_path and active_planning_payload is not None:
@@ -574,11 +582,12 @@ def run(source, config: SourceConfig) -> None:
                     active_planning_payload["goal_pose"],
                     thickness=6,
                 )
-                draw_planner_nodes(
-                    display_frame,
-                    planner_debug_nodes,
-                    project,
-                )
+                if overlay_state["debug"]["planner_nodes"]:
+                    draw_planner_nodes(
+                        display_frame,
+                        planner_debug_nodes,
+                        project,
+                    )
 
             canvas = build_display_canvas(
                 display_frame,
