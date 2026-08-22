@@ -119,7 +119,14 @@ def draw_debug_measurements_on_frame(frame, payload, selected_slot_id=None):
         box_i = _w2i(payload, box).reshape(-1, 1, 2)
 
         selected = slot_id == selected_slot_id
-        color = (255, 0, 0) if selected else (0, 255, 255)
+        occupied = bool(slot.get("occupied", not slot.get("free", True)))
+
+        if occupied:
+            color = (0, 0, 255)
+        elif selected:
+            color = (255, 0, 0)
+        else:
+            color = (0, 255, 255)
         thick = 2 if selected else 1
 
         cv2.polylines(frame, [box_i], True, color, thick, cv2.LINE_AA)
@@ -162,7 +169,7 @@ def draw_planner_nodes(frame, nodes, project):
         )
 
         p = project(float(x), float(y), frame)
-        cv2.circle(frame, p, 1, color, -1)
+        cv2.circle(frame, p, 2, color, -1)
 
 def draw_drivable_area_on_frame(frame, payload: dict) -> None:
     area = payload.get("drivable_area")
@@ -542,6 +549,7 @@ def draw_slot_overlay(frame, slots, selected_slot_id, overlay_state, panel_rect,
         ("planner_nodes", "Nodes"),
         ("measurements", "Geometry"),
         ("aruco_axes", "ArUco axes"),
+        ("drivable_area", "Drivable area"),
     ]
 
     margin = 14
@@ -623,25 +631,20 @@ def draw_scene_on_frame(frame, payload, slots, selected_slot_id, project, state=
     if state is not None:
         state["slot_polygons"] = []
 
-    for i, obs in enumerate(payload.get("obstacles", [])):
-        draw_box_on_frame(
-            frame,
-            obs,
-            project,
-            label=f"obs {i}",
-            color=(0, 255, 255),
-            thickness=2,
-        )
-
     for slot in slots:
         slot_id = int(slot["id"])
         is_selected = slot_id == selected_slot_id
         is_parked = slot_id == parked_slot_id
+        is_occupied = bool(slot.get("occupied", not slot.get("free", True)))
 
         if is_parked:
             color = (0, 255, 0)
             thickness = 4
             label = f"PARKED {slot_id}"
+        elif is_occupied:
+            color = (0, 0, 255)
+            thickness = 4 if is_selected else 3
+            label = f"BLOCKED {slot_id}"
         elif is_selected:
             color = (255, 0, 0)
             thickness = 3
@@ -651,7 +654,14 @@ def draw_scene_on_frame(frame, payload, slots, selected_slot_id, project, state=
             thickness = 2
             label = f"slot {slot_id}"
 
-        pts = draw_box_on_frame(frame, slot, project, label, color, thickness)
+        pts = draw_box_on_frame(
+            frame,
+            slot,
+            project,
+            label,
+            color,
+            thickness,
+        )
 
         if state is not None:
             state["slot_polygons"].append((slot_id, pts))

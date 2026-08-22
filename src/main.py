@@ -138,6 +138,37 @@ def distance_xy(a: dict, b: dict) -> float:
 def angle_distance(a: float, b: float) -> float:
     return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
 
+def parking_angle_distance(a, b):
+    d = angle_distance(a, b)
+    return min(d, abs(math.pi - d))
+
+
+def find_parked_slot_id(pose, slots, position_tolerance=0.09, yaw_tolerance=math.radians(20)):
+    x = float(pose["x"])
+    y = float(pose["y"])
+    yaw = float(pose.get("yaw", 0.0))
+
+    best_slot_id = None
+    best_distance = float("inf")
+
+    for slot in slots:
+        dx = x - float(slot["x"])
+        dy = y - float(slot["y"])
+        distance = math.hypot(dx, dy)
+
+        if distance > position_tolerance:
+            continue
+
+        slot_yaw = float(slot.get("yaw", 0.0))
+
+        if parking_angle_distance(yaw, slot_yaw) > yaw_tolerance:
+            continue
+
+        if distance < best_distance:
+            best_distance = distance
+            best_slot_id = int(slot["id"])
+
+    return best_slot_id
 
 def slot_distance(a: dict, b: dict) -> float:
     return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"]))
@@ -279,6 +310,7 @@ def run(source, config: SourceConfig) -> None:
     planned_goal = None
     planner_debug_nodes = []
     force_replan = True
+    parked_slot_id = None
 
     planner_executor = ProcessPoolExecutor(max_workers=1)
     planner_future = None
@@ -299,6 +331,7 @@ def run(source, config: SourceConfig) -> None:
             "planner_nodes": True,
             "measurements": False,
             "aruco_axes": True,
+            "drivable_area": True,
         },
     }
 
@@ -376,6 +409,19 @@ def run(source, config: SourceConfig) -> None:
             selected_slot_index = stable_index
 
             force_replan = False
+            if not is_slot_free(slots[selected_slot_index]):
+                new_index = next_free_slot_index(slots, selected_slot_index, 1)
+
+                if new_index is not None:
+                    selected_slot_index = new_index
+                    selected_slot_id = int(slots[new_index]["id"])
+
+                    active_path = []
+                    active_path_index = 0
+                    active_planning_payload = None
+                    planned_goal = None
+                    planner_debug_nodes = []
+                    force_replan = True
 
             if overlay_state["clicked_slot_id"] is not None:
                 clicked_id = overlay_state["clicked_slot_id"]
@@ -430,6 +476,7 @@ def run(source, config: SourceConfig) -> None:
                 selected_slot_id = selected_slot["id"]
             current_pose = payload["start_pose"]
             obstacles = payload.get("obstacles", [])
+            parked_slot_id = find_parked_slot_id(current_pose, slots)
             planning_payload_current = set_goal_from_slot(payload.copy(), selected_slot)
             project = make_projector(config, payload, source=source)
 
@@ -513,9 +560,12 @@ def run(source, config: SourceConfig) -> None:
 
             plan_reason = None
 
-            if force_replan:
+            if parked_slot_id == selected_slot_id:
+                active_path = []
+                active_path_index = 0
+            elif force_replan:
                 plan_reason = "slot"
-            elif not active_path:
+            elif not active_path and cooldown_done:
                 plan_reason = "initial"
             elif hard_off_path:
                 plan_reason = "off_path"
@@ -556,8 +606,9 @@ def run(source, config: SourceConfig) -> None:
             t = time.perf_counter()
 
             display_frame = prediction_frame.copy() if prediction_frame is not None else frame.copy()
-            draw_parking_mat_on_frame(display_frame, payload)
-            draw_drivable_area_on_frame(display_frame, payload)
+            #draw_parking_mat_on_frame(display_frame, payload)
+            if overlay_state["debug"]["drivable_area"]:
+                draw_drivable_area_on_frame(display_frame, payload)
             draw_scene_on_frame(
                 display_frame,
                 payload,
@@ -565,6 +616,7 @@ def run(source, config: SourceConfig) -> None:
                 selected_slot_id,
                 project,
                 overlay_state,
+                parked_slot_id,
             )
             if overlay_state["debug"]["measurements"]:
                 draw_debug_measurements_on_frame(

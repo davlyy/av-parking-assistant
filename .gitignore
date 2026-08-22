@@ -8,4 +8,5 @@ data/raw/
 debug_frames/
 carla
 !best.pt
+!best_pose.pt
 runs

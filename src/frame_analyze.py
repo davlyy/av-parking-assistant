@@ -1,4 +1,6 @@
 import argparse
+import math
+
 import cv2
 import numpy as np
 from pathlib import Path
@@ -118,6 +120,103 @@ PIXELS_PER_METER: float = None  # set by calibrate_from_ego()
 
 #Roboflow Client (lazy, only needed for the Roboflow detector)
 roboflow_client = get_roboflow_client()
+def rect_to_poly(x, y, length, width, yaw):
+    hl = length / 2.0
+    hw = width / 2.0
+
+    pts = np.array([
+        [-hl, -hw],
+        [ hl, -hw],
+        [ hl,  hw],
+        [-hl,  hw],
+    ], dtype=np.float32)
+
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+
+    R = np.array([
+        [c, -s],
+        [s,  c],
+    ], dtype=np.float32)
+
+    pts = pts @ R.T
+    pts[:, 0] += x
+    pts[:, 1] += y
+
+    return pts
+
+
+def slot_is_occupied(slot, obstacles, overlap_ratio_thresh=0.25, inflate_obstacle=0.005):
+    slot_poly = rect_to_poly(
+        float(slot["x"]),
+        float(slot["y"]),
+        float(slot["length"]),
+        float(slot["width"]),
+        float(slot.get("yaw", 0.0)),
+    )
+
+    slot_area = float(slot["length"]) * float(slot["width"])
+
+    for obs in obstacles:
+        obs_length = float(obs["world_length"] if "world_length" in obs else obs["length"])
+        obs_width = float(obs["world_width"] if "world_width" in obs else obs["width"])
+        obs_x = float(obs["world_x"] if "world_x" in obs else obs["x"])
+        obs_y = float(obs["world_y"] if "world_y" in obs else obs["y"])
+        obs_yaw = float(obs.get("yaw", estimate_yaw(obs)))
+
+        obs_poly = rect_to_poly(
+            obs_x,
+            obs_y,
+            obs_length + 2.0 * inflate_obstacle,
+            obs_width + 2.0 * inflate_obstacle,
+            obs_yaw,
+        )
+
+        inter_area, _ = cv2.intersectConvexConvex(
+            slot_poly.astype(np.float32),
+            obs_poly.astype(np.float32),
+        )
+
+        obs_area = (
+            (obs_length + 2.0 * inflate_obstacle)
+            * (obs_width + 2.0 * inflate_obstacle)
+        )
+
+        reference_area = min(slot_area, obs_area)
+
+        if reference_area > 1e-6 and inter_area / reference_area >= overlap_ratio_thresh:
+            return True
+
+        if cv2.pointPolygonTest(
+            slot_poly,
+            (obs_x, obs_y),
+            False,
+        ) >= 0:
+            return True
+
+        if cv2.pointPolygonTest(
+            obs_poly,
+            (float(slot["x"]), float(slot["y"])),
+            False,
+        ) >= 0:
+            return True
+
+    return False
+
+
+def assign_occupancy_to_slots(obstacles):
+    slots = []
+
+    for base_slot in PARKING_SLOTS:
+        slot = base_slot.copy()
+        occupied = slot_is_occupied(slot, obstacles)
+
+        slot["occupied"] = occupied
+        slot["free"] = not occupied
+
+        slots.append(slot)
+
+    return slots
 
 def image_to_world(x, y, H):
     p = np.array([x, y, 1.0], dtype=np.float64)
@@ -148,35 +247,6 @@ def detection_to_world(pred, H):
         "world_length": max(size_x, size_y),
         "world_width": min(size_x, size_y),
     }
-
-def assign_occupancy_to_slots(cars, H_image_to_world):
-    car_positions = []
-
-    for car in cars:
-        x, y = image_to_world(car["x"], car["y"], H_image_to_world)
-        car_positions.append((x, y))
-
-    slots = []
-
-    for slot in PARKING_SLOTS:
-        yaw = float(slot["yaw"])
-        c, s = np.cos(yaw), np.sin(yaw)
-        occupied = False
-
-        for car_x, car_y in car_positions:
-            dx = car_x - slot["x"]
-            dy = car_y - slot["y"]
-
-            local_x = c * dx + s * dy
-            local_y = -s * dx + c * dy
-
-            if abs(local_x) <= slot["length"] / 2 and abs(local_y) <= slot["width"] / 2:
-                occupied = True
-                break
-
-        slots.append({**slot, "free": not occupied})
-
-    return slots
 
 #Calibration
 def calibrate_from_ego(ego: dict) -> float:
@@ -985,14 +1055,25 @@ def filter_slots_by_median_area(avail, tolerance=0.30):
 
 #[Stage 5]: Build A* JSON Payload
 def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, image_width=None, image_height=None, parking_mat_corners=None, input_calibration=None):
-    available = [slot for slot in slots if slot["free"]]
-
-    if ego is None or not available:
-        debug_print("[Warn] Cannot build payload: missing ego or available slots")
+    if ego is None:
         return None
 
-    available = sorted(available, key=lambda s: np.hypot(s["x"] - ego["world_x"], s["y"] - ego["world_y"]))
+    available = [slot for slot in slots if slot.get("free", True)]
+
+    if not available:
+        debug_print("[Warn] Cannot build payload: no free parking slots")
+        return None
+
+    available = sorted(
+        available,
+        key=lambda slot: np.hypot(
+            slot["x"] - ego["world_x"],
+            slot["y"] - ego["world_y"],
+        ),
+    )
+
     target = available[0]
+
     drivable_image = [
         world_to_image(x, y, H_world_to_image)
         for x, y in DRIVABLE_AREA_WORLD
@@ -1009,8 +1090,15 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
         "parking_mat_bounds": {
             "coordinate_space": "image_pixels",
             "corners": [
-                {"name": name, "x": round(float(p[0]), 2), "y": round(float(p[1]), 2)}
-                for name, p in zip(("top_left", "top_right", "bottom_right", "bottom_left"), parking_mat_corners)
+                {
+                    "name": name,
+                    "x": round(float(p[0]), 2),
+                    "y": round(float(p[1]), 2),
+                }
+                for name, p in zip(
+                    ("top_left", "top_right", "bottom_right", "bottom_left"),
+                    parking_mat_corners,
+                )
             ],
         } if parking_mat_corners is not None else None,
         "input_calibration": input_calibration,
@@ -1034,7 +1122,7 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
                 "y": round(o["world_y"], 3),
                 "length": round(o["world_length"], 3),
                 "width": round(o["world_width"], 3),
-                "yaw": estimate_yaw(o),
+                "yaw": float(o.get("yaw", estimate_yaw(o))),
             }
             for o in obstacles
         ],
@@ -1043,10 +1131,6 @@ def build_astar_payload(ego, obstacles, slots, H_world_to_image, frame_id=0, ima
         "available_parking_slots": [slot.copy() for slot in available],
         "vehicle": get_estimated_vehicle_spec(),
     }
-
-    if DEBUG:
-        #print(json.dumps(payload, indent=2))
-        print(get_estimated_vehicle_spec())
 
     return payload
 
@@ -1202,7 +1286,10 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
         for obstacle in obstacles
     ]
 
-    slots = assign_occupancy_to_slots(cars, H_image_to_world)
+    for obstacle in obstacles:
+        obstacle["yaw"] = estimate_yaw(obstacle)
+
+    slots = assign_occupancy_to_slots(obstacles)
 
     debug_print(
         f"[Debug] Ego: {ego['class'] if ego else 'None'} | "
@@ -1225,7 +1312,7 @@ def process_frame(frame, debug_dir=None, frame_id=0, detector="roboflow",
     result = draw_detections(frame, cars, avail, ego, obstacles) if visualize else None
 
     if result is not None:
-        draw_parking_slots(result, slots, H_world_to_image)
+        #draw_parking_slots(result, slots, H_world_to_image)
         draw_aruco_debug(result, _cached_aruco_markers, H_world_to_image)
 
     if debug_dir and result is not None:
